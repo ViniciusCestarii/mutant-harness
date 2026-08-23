@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# mutant-harness - have an agent read one Bitcoin Core file and plant mutants in it.
+#
+#   mutant-harness --file src/script/interpreter.cpp
+#   mutant-harness --file src/net_processing.cpp --count 20 --focus "compact blocks"
+#
+set -euo pipefail
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${MUTANT_HARNESS_IMAGE:-mutant-harness-core:latest}"
+
+TARGET_FILE=""
+COUNT=12
+FOCUS=""
+LINE_RANGE=""
+OPS=""
+OUT_ROOT="$PWD/results"
+MODEL="opus"
+REVIEW=1
+REVIEW_MODEL=""
+FALLBACK_MODEL=""
+REPO_MOUNT=""
+BIPS_REPO_MOUNT=""
+REBUILD=0
+UPDATE_CORE=0
+UPDATE_BIPS=0
+SHELL_MODE=0
+TIMEOUT=""
+DETACH=0
+APPLY_PATCH=""
+EXTRA_DOCKER_ARGS=()
+
+log()  { printf '\033[36m[mutant-harness]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33m[mutant-harness]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m[mutant-harness]\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat >&2 <<'EOF'
+mutant-harness - run Claude Code in a container to plant mutants in a Core file
+
+Usage:
+  mutant-harness --file <path-in-core> [options]
+  mutant-harness --apply <patch> --repo <core-clone>
+
+Options:
+  --file <path>        File to mutate, relative to the Bitcoin Core tree
+                       (e.g. src/script/interpreter.cpp). Required.
+  --count <n>          How many mutants to aim for (default: 12)
+  --focus <text>       Steer the agent at one area ("segwit v1 witness parsing",
+                       "the fee estimator", a function name, ...)
+  --lines <a-b>        Restrict mutations to this line range of the file
+  --ops <list>         Comma-separated operator classes to prefer, from:
+                       deletion, relocation, reorder, boundary, condition,
+                       constant, scope, state, error-handling, numeric,
+                       early-exit, concurrency, serialization
+  --out <dir>          Output root (default: ./results); results land in
+                       <dir>/<file-slug>-<timestamp>/
+  --model <name>       Model for the mutator (default: opus)
+  --no-review          Skip the second-pass review of the mutants
+  --review-model <n>   Model for the review pass (default: same as --model)
+  --fallback-model <n> Fallback when the primary is overloaded
+  --repo <path>        Mount a host Bitcoin Core clone instead of the baked-in one
+  --bips-repo <path>   Mount a host bitcoin/bips clone instead of the baked-in one
+  --update-core        git fetch master inside the container first
+  --update-bips        git fetch the bips repo too
+  --rebuild            Rebuild the docker image first
+  --build-only         Build the image and exit
+  --timeout <dur>      Kill the run after this long (e.g. 45m); needs `timeout`
+  --detach             Run the container in the background and print its name
+  --shell              Drop into a shell in the container instead of mutating
+  --docker-arg <arg>   Extra arg passed through to `docker run` (repeatable)
+  --apply <patch>      Apply one produced patch to --repo and exit (no container)
+  -h, --help           This help
+
+Auth: uses ANTHROPIC_API_KEY if set, otherwise copies ~/.claude/.credentials.json
+into the run directory and mounts it (the host file is never modified).
+EOF
+}
+
+BUILD_ONLY=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --file)           TARGET_FILE="${2:?}"; shift 2 ;;
+        --count)          COUNT="${2:?}"; shift 2 ;;
+        --focus)          FOCUS="${2:?}"; shift 2 ;;
+        --lines)          LINE_RANGE="${2:?}"; shift 2 ;;
+        --ops)            OPS="${2:?}"; shift 2 ;;
+        --out)            OUT_ROOT="${2:?}"; shift 2 ;;
+        --model)          MODEL="${2:?}"; shift 2 ;;
+        --no-review)      REVIEW=0; shift ;;
+        --review-model)   REVIEW_MODEL="${2:?}"; shift 2 ;;
+        --fallback-model) FALLBACK_MODEL="${2:?}"; shift 2 ;;
+        --repo)           REPO_MOUNT="${2:?}"; shift 2 ;;
+        --bips-repo)      BIPS_REPO_MOUNT="${2:?}"; shift 2 ;;
+        --update-core)    UPDATE_CORE=1; shift ;;
+        --update-bips)    UPDATE_BIPS=1; shift ;;
+        --rebuild)        REBUILD=1; shift ;;
+        --build-only)     BUILD_ONLY=1; shift ;;
+        --timeout)        TIMEOUT="${2:?}"; shift 2 ;;
+        --detach)         DETACH=1; shift ;;
+        --shell)          SHELL_MODE=1; shift ;;
+        --apply)          APPLY_PATCH="${2:?}"; shift 2 ;;
+        --docker-arg)     EXTRA_DOCKER_ARGS+=("${2:?}"); shift 2 ;;
+        -h|--help)        usage; exit 0 ;;
+        *)                die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+# ----------------------------------------------------------------- apply ----
+# Applying a produced mutant to a real clone is a local git operation; it needs
+# no image and no agent, so handle it before anything else.
+if [[ -n "$APPLY_PATCH" ]]; then
+    [[ -r "$APPLY_PATCH" ]] || die "cannot read $APPLY_PATCH"
+    [[ -n "$REPO_MOUNT" ]]  || die "--apply needs --repo <core-clone>"
+    [[ -d "$REPO_MOUNT/.git" ]] || die "--repo $REPO_MOUNT is not a git clone"
+    git -C "$REPO_MOUNT" apply --check "$(cd "$(dirname "$APPLY_PATCH")" && pwd)/$(basename "$APPLY_PATCH")" \
+        || die "patch does not apply to $REPO_MOUNT (wrong commit?)"
+    git -C "$REPO_MOUNT" apply "$(cd "$(dirname "$APPLY_PATCH")" && pwd)/$(basename "$APPLY_PATCH")"
+    log "applied $(basename "$APPLY_PATCH") to $REPO_MOUNT"
+    log "revert with: git -C $REPO_MOUNT checkout -- ."
+    exit 0
+fi
+
+command -v docker >/dev/null || die "docker not found on PATH"
+
+# ---------------------------------------------------------------- image ----
+build_image() {
+    log "building $IMAGE (first build clones Bitcoin Core and the BIPs, a few minutes)"
+    docker build -t "$IMAGE" "$HERE/docker"
+}
+
+# What this harness needs the image to contain. Bumped in the Dockerfile too.
+IMAGE_VERSION=1
+
+image_label() {
+    docker image inspect "$IMAGE" --format "{{index .Config.Labels \"$1\"}}" 2>/dev/null
+}
+
+# An image with our tag but without our label belongs to something else; rebuild
+# rather than silently running a stranger's entrypoint.
+image_is_ours()    { [[ "$(image_label org.mutant-harness.kind)" == "core-mutant-gen" ]]; }
+image_is_current() { [[ "$(image_label org.mutant-harness.version)" == "$IMAGE_VERSION" ]]; }
+
+if [[ "$REBUILD" == 1 ]] || ! image_is_ours || ! image_is_current; then
+    if docker image inspect "$IMAGE" >/dev/null 2>&1 && [[ "$REBUILD" == 0 ]]; then
+        if image_is_ours; then
+            warn "$IMAGE predates this harness (needs v$IMAGE_VERSION); rebuilding"
+        else
+            warn "$IMAGE exists but is not a mutant-harness image; rebuilding over it"
+        fi
+    fi
+    build_image
+fi
+[[ "$BUILD_ONLY" == 1 ]] && { log "image ready: $IMAGE"; exit 0; }
+
+# ----------------------------------------------------------------- args ----
+[[ -n "$TARGET_FILE" ]] || die "--file is required (e.g. --file src/script/interpreter.cpp)"
+# The path is resolved inside the container against the Core tree, so keep it
+# relative and refuse anything that could escape it.
+TARGET_FILE="${TARGET_FILE#./}"
+[[ "$TARGET_FILE" != /* ]]   || die "--file must be relative to the Core tree, got: $TARGET_FILE"
+[[ "$TARGET_FILE" != *..* ]] || die "--file must not contain '..': $TARGET_FILE"
+[[ "$COUNT" =~ ^[0-9]+$ ]] && (( COUNT > 0 )) || die "--count takes a positive number, got: $COUNT"
+[[ -z "$LINE_RANGE" || "$LINE_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "--lines takes a-b, got: $LINE_RANGE"
+
+SLUG="$(printf '%s' "$TARGET_FILE" | tr '/.' '--' | sed 's/^-*//')"
+
+# ------------------------------------------------------------- run dir ----
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="$OUT_ROOT/$SLUG-$STAMP"
+WORK_DIR="$RUN_DIR/work"
+OUT_DIR="$RUN_DIR/out"
+mkdir -p "$WORK_DIR" "$OUT_DIR/patches"
+
+cp "$HERE/prompts/mutate.md" "$WORK_DIR/prompt.md"
+cp "$HERE/prompts/review.md" "$WORK_DIR/review.md"
+
+# ------------------------------------------------------------------ auth ----
+AUTH_ARGS=()
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    log "auth: ANTHROPIC_API_KEY"
+    AUTH_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+elif [[ -r "$HOME/.claude/.credentials.json" ]]; then
+    log "auth: copy of ~/.claude/.credentials.json (host file untouched)"
+    mkdir -p "$WORK_DIR/claude-home"
+    cp "$HOME/.claude/.credentials.json" "$WORK_DIR/claude-home/.credentials.json"
+    chmod 600 "$WORK_DIR/claude-home/.credentials.json"
+    AUTH_ARGS+=(-v "$(cd "$WORK_DIR/claude-home" && pwd):/home/agent/.claude")
+else
+    die "no auth: set ANTHROPIC_API_KEY or log in on the host (~/.claude/.credentials.json)"
+fi
+
+# ------------------------------------------------------------------- run ----
+CONTAINER="mutant-harness-$SLUG-$STAMP"
+DOCKER_ARGS=(
+    run --rm
+    --name "$CONTAINER"
+    --user "$(id -u):$(id -g)"
+    -v "$(cd "$WORK_DIR" && pwd):/work"
+    -v "$(cd "$OUT_DIR" && pwd):/out"
+    -e "TARGET_FILE=$TARGET_FILE"
+    -e "MUTANT_COUNT=$COUNT"
+    -e "FOCUS=$FOCUS"
+    -e "LINE_RANGE=$LINE_RANGE"
+    -e "OPS=$OPS"
+    -e "PROMPT_TEMPLATE=/work/prompt.md"
+    -e "REVIEW_PROMPT_TEMPLATE=/work/review.md"
+    -e "REPORT_FILE=/out/report.json"
+    -e "MANIFEST_FILE=/out/mutants.json"
+    -e "REVIEWED_FILE=/out/mutants-reviewed.json"
+    -e "PATCH_DIR=/out/patches"
+    -e "REVIEW=$REVIEW"
+    -e "REVIEW_MODEL=$REVIEW_MODEL"
+    -e "OUT_DIR=/out"
+    -e "MODEL=$MODEL"
+    -e "FALLBACK_MODEL=$FALLBACK_MODEL"
+    -e "UPDATE_CORE=$UPDATE_CORE"
+    -e "UPDATE_BIPS=$UPDATE_BIPS"
+    -e "HOME=/home/agent"
+)
+[[ -n "$REPO_MOUNT" ]] && {
+    [[ -d "$REPO_MOUNT/.git" ]] || die "--repo $REPO_MOUNT is not a git clone"
+    DOCKER_ARGS+=(-v "$(cd "$REPO_MOUNT" && pwd):/src/bitcoin")
+    warn "using host Core clone: $REPO_MOUNT (the agent edits and reverts files in it)"
+}
+[[ -n "$BIPS_REPO_MOUNT" ]] && {
+    [[ -d "$BIPS_REPO_MOUNT/.git" ]] || die "--bips-repo $BIPS_REPO_MOUNT is not a git clone"
+    DOCKER_ARGS+=(-v "$(cd "$BIPS_REPO_MOUNT" && pwd):/src/bips")
+    log "using host bips clone: $BIPS_REPO_MOUNT"
+}
+DOCKER_ARGS+=("${AUTH_ARGS[@]}")
+[[ ${#EXTRA_DOCKER_ARGS[@]} -gt 0 ]] && DOCKER_ARGS+=("${EXTRA_DOCKER_ARGS[@]}")
+
+if [[ "$SHELL_MODE" == 1 ]]; then
+    log "shell mode: entering $IMAGE"
+    exec docker "${DOCKER_ARGS[@]}" -it --entrypoint /bin/bash "$IMAGE"
+fi
+
+if [[ "$DETACH" == 1 ]]; then
+    docker "${DOCKER_ARGS[@]}" -d "$IMAGE" >/dev/null
+    log "running detached as $CONTAINER"
+    log "  logs:    docker logs -f $CONTAINER"
+    log "  results: $OUT_DIR/mutants.json"
+    exit 0
+fi
+
+log "run dir: $RUN_DIR"
+log "mutating $TARGET_FILE (target $COUNT mutants, model=$MODEL) ..."
+
+set +e
+if [[ -n "$TIMEOUT" ]]; then
+    command -v timeout >/dev/null || die "--timeout needs coreutils timeout(1)"
+    timeout --signal=TERM "$TIMEOUT" docker "${DOCKER_ARGS[@]}" "$IMAGE"
+    RC=$?
+    [[ $RC == 124 ]] && { warn "timed out after $TIMEOUT"; docker kill "$CONTAINER" >/dev/null 2>&1; }
+else
+    docker "${DOCKER_ARGS[@]}" "$IMAGE"
+    RC=$?
+fi
+set -e
+
+MANIFEST="$OUT_DIR/mutants.json"
+REVIEWED="$OUT_DIR/mutants-reviewed.json"
+
+# Show the reviewed file when the second pass produced one, so the verdicts are
+# what you read first.
+SUMMARY_SRC="$MANIFEST"
+[[ -s "$REVIEWED" ]] && command -v jq >/dev/null \
+    && jq empty "$REVIEWED" 2>/dev/null && SUMMARY_SRC="$REVIEWED"
+
+if [[ -s "$MANIFEST" ]] && command -v jq >/dev/null && jq empty "$MANIFEST" 2>/dev/null; then
+    ln -sfn "$(cd "$RUN_DIR" && pwd)" "$OUT_ROOT/$SLUG-latest"
+    echo
+    jq -r '
+      "target: \(.target.file // "?")  (\(.target.lines // "whole file"))",
+      "core:   \(.repo.commit[0:12] // "?")",
+      "\((.mutants // []) | length) mutants, " +
+        "\([.mutants[]? | select(.apply_ok == false)] | length) that do not apply",
+      (if .review then
+         "review: \(.review.sneaky // 0) sneaky, \(.review.likely_killed // 0) likely-killed, " +
+         "\(.review.equivalent // 0) equivalent, \(.review.invalid // 0) invalid"
+       else "review: not run" end),
+      "",
+      ((.mutants // []) | sort_by(
+          [((.verdict // "sneaky") as $v
+              | ["sneaky","likely-killed","equivalent","invalid"] | index($v) // 9),
+           ((.severity_if_undetected // "info") as $s
+              | ["critical","high","medium","low","info"] | index($s) // 9)]
+        )[] |
+        "  \(.id) [\(.severity_if_undetected // "?")]" +
+        "\(if .verdict then " [\(.verdict)]" else "" end) " +
+        "\(.operator // "?") @\(.location.lines // "?"): \(.title)"),
+      "",
+      "summary: \(.summary // "")"
+    ' "$SUMMARY_SRC"
+    echo
+    if [[ "$SUMMARY_SRC" == "$REVIEWED" ]]; then
+        log "reviewed mutants: $REVIEWED   <- start here"
+        log "raw mutants:      $MANIFEST"
+        log "review trace:     $OUT_DIR/review.txt"
+    else
+        log "mutants:          $MANIFEST"
+    fi
+    log "patches:          $OUT_DIR/patches/"
+    log "full report:      $OUT_DIR/report.json"
+    log "trace:            $OUT_DIR/session.txt"
+    log "apply one:        mutant-harness --apply $OUT_DIR/patches/mut-001.patch --repo <core-clone>"
+    exit 0
+fi
+
+warn "no valid mutants.json produced (container rc=$RC)"
+warn "inspect: $OUT_DIR/session.stream.jsonl"
+exit "${RC:-1}"

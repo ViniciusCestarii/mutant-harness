@@ -1,0 +1,166 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "mutant-harness manifest",
+  "description": "Shape of out/mutants.json. out/report.json is the same object plus the agent's long-form `notes`; out/mutants-reviewed.json is the same object with a verdict on each mutant and a top-level `review` block.",
+  "type": "object",
+  "required": ["target", "summary", "mutants"],
+  "properties": {
+    "target": {
+      "description": "The mutated file, stamped by the harness.",
+      "type": "object",
+      "required": ["file"],
+      "properties": {
+        "file": { "type": "string" },
+        "file_lines": { "type": "integer" },
+        "lines": { "type": ["string", "null"], "description": "--lines range, if any" },
+        "focus": { "type": ["string", "null"], "description": "--focus text, if any" }
+      }
+    },
+    "repo": {
+      "description": "The Bitcoin Core clone the patches were cut against, stamped by the harness. Patches apply to this commit and no other.",
+      "type": "object",
+      "properties": {
+        "commit": { "type": "string" },
+        "head": { "type": "string" }
+      }
+    },
+    "bips_repo": {
+      "type": "object",
+      "properties": {
+        "commit": { "type": "string" },
+        "head": { "type": "string" }
+      }
+    },
+    "harness": {
+      "type": "object",
+      "properties": {
+        "model": { "type": "string" },
+        "requested_mutants": { "type": "integer" },
+        "finished_at": { "type": "string" },
+        "duration_seconds": { "type": "integer" }
+      }
+    },
+    "review": {
+      "description": "Present only in mutants-reviewed.json.",
+      "type": "object",
+      "properties": {
+        "model": { "type": "string" },
+        "finished_at": { "type": "string" },
+        "duration_seconds": { "type": "integer" },
+        "sneaky": { "type": "integer" },
+        "likely_killed": { "type": "integer" },
+        "equivalent": { "type": "integer" },
+        "invalid": { "type": "integer" },
+        "status": { "type": "string" }
+      }
+    },
+    "summary": { "type": "string" },
+    "specs": {
+      "description": "BIPs the agent found governing this file.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["bip"],
+        "properties": {
+          "bip": { "type": "integer" },
+          "title": { "type": "string" },
+          "relevance": { "type": "string" }
+        }
+      }
+    },
+    "coverage_map": {
+      "type": "object",
+      "properties": {
+        "tests_found": { "type": "array", "items": { "type": "string" } },
+        "well_covered": { "type": "array", "items": { "type": "string" } },
+        "thinly_covered": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "orphan_patches": {
+      "description": "Patch files on disk with no manifest entry; stamped by the harness.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "notes": {
+      "description": "Long-form agent notes. Kept in report.json, stripped from mutants.json.",
+      "type": "string"
+    },
+    "mutants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "operator", "location", "trigger",
+                     "severity_if_undetected"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^mut-[0-9]+$" },
+          "title": { "type": "string" },
+          "operator": {
+            "type": "string",
+            "enum": ["deletion", "relocation", "reorder", "scope", "boundary",
+                     "condition", "constant", "state", "error-handling",
+                     "numeric", "early-exit", "concurrency", "serialization"]
+          },
+          "location": {
+            "type": "object",
+            "properties": {
+              "function": { "type": "string" },
+              "lines": { "type": "string" }
+            }
+          },
+          "original": { "type": "string" },
+          "mutated": { "type": "string" },
+          "intent": { "type": "string" },
+          "behaviour_change": { "type": "string" },
+          "trigger": { "type": "string" },
+          "spec_violation": { "type": ["string", "null"] },
+          "severity_if_undetected": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low", "info"]
+          },
+          "kill_prediction": {
+            "type": "object",
+            "properties": {
+              "likely_killed": { "type": "boolean" },
+              "by": { "type": "string" },
+              "where_you_looked": { "type": "string" }
+            }
+          },
+          "plausibility": { "type": "string" },
+          "compile_confidence": { "type": "string" },
+          "equivalence_risk": { "type": "string" },
+
+          "patch": {
+            "description": "Path to the patch, relative to out/. Stamped by the harness.",
+            "type": "string"
+          },
+          "apply_ok": {
+            "description": "Whether `git apply --check` accepted the patch against repo.commit, and it touches only the target file and changes at least one line. Stamped by the harness; the agent's claims are overwritten.",
+            "type": "boolean"
+          },
+          "apply_error": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "lines_added": { "type": "integer" },
+          "lines_removed": { "type": "integer" },
+          "patch_sha256": {
+            "description": "sha256 of the patch's +/- lines only, so duplicates are detected across differing hunk headers.",
+            "type": "string"
+          },
+          "duplicate_of": {
+            "description": "Id of the earlier mutant with an identical body, if any.",
+            "type": "string"
+          },
+
+          "verdict": {
+            "description": "Present only in mutants-reviewed.json.",
+            "type": "string",
+            "enum": ["sneaky", "likely-killed", "equivalent", "invalid"]
+          },
+          "compiles": { "type": "boolean" },
+          "reachable": { "type": "boolean" },
+          "killed_by": { "type": "string" },
+          "verdict_reason": { "type": "string" }
+        }
+      }
+    }
+  }
+}
