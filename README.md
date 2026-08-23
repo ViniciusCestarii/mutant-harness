@@ -1,5 +1,10 @@
 # mutant-harness
 
+> ⚠️ Disclaimer
+> 
+> This project was largely vibe-coded and has not been thoroughly reviewed by the author. Parts of the codebase, including this README, may contain mistakes, inconsistencies, or inaccurate information. Use it as-is and review the code before relying on it.
+
+
 Runs Claude Code inside a throwaway Docker container to read **one Bitcoin Core
 file**, work out what it is responsible for and who tests it, and plant a set of
 **plausible bugs** in it. You get one `git`-applicable patch per mutant plus a
