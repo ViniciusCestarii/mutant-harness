@@ -83,6 +83,7 @@ of that shape would go undetected.
 git clone <this repo> && cd mutant-harness
 ./bin/mutant-harness --build-only     # ~5 min: clones Core and the BIP repo into the image
 ln -s "$PWD/bin/mutant-harness" ~/.local/bin/mutant-harness
+ln -s "$PWD/bin/mutant-verify"  ~/.local/bin/mutant-verify
 ```
 
 Requires `docker` and `jq`.
@@ -116,9 +117,48 @@ git -C ~/src/bitcoin checkout -- .                  # revert
 ```
 
 `--apply` is a plain local `git apply` with a pre-check; it needs no container.
-For a full kill/survive sweep, feed the patch directory to whatever runner you
-already use - the manifest is machine-readable and `apply_ok` tells you which
-ones are safe to queue.
+
+### Verifying them: `mutant-verify`
+
+`bin/mutant-verify` does the whole kill/survive sweep. For each patch, in your
+own clone, one at a time:
+
+```
+git apply  ->  cmake --build  ->  ctest  ->  test/functional/test_runner.py
+```
+
+The first stage that fails decides the verdict, and the tree is reverted before
+the next mutant either way.
+
+```sh
+mutant-verify --repo ~/src/bitcoin --patches results/src-script-interpreter-cpp-latest/out/patches
+mutant-verify --repo ~/src/bitcoin --patches .../patches --only mut-003,mut-007
+mutant-verify --repo ~/src/bitcoin --patches .../patches --skip-functional   # fast first pass
+mutant-verify --repo ~/src/bitcoin --patches .../patches --resume            # after a Ctrl-C
+mutant-verify --repo ~/src/bitcoin --patches .../patches \
+    --functional-arg feature_taproot.py --functional-arg p2p_segwit.py
+```
+
+| status | meaning |
+| --- | --- |
+| `live` | built, `ctest` green, functional suite green - **nothing noticed** |
+| `live-unit` | survived `ctest`; functional run was skipped |
+| `dead` | a suite failed; `killed_by` is `ctest` or `functional` |
+| `build-failed` | the mutant does not compile |
+| `apply-failed` | the patch does not apply to this checkout (wrong commit?) |
+
+Results are appended as JSONL to `out/verify/results.jsonl`, with the full
+output of every stage under `out/verify/logs/<id>.log`:
+
+```sh
+jq -r 'select(.status=="live") | .id' out/verify/results.jsonl
+```
+
+The clone must have no uncommitted tracked changes (untracked files, `build/`
+included, are ignored) and must already be configured - `mutant-verify` builds,
+it does not run `cmake -B`. Use `--baseline` on a fresh clone to prove the
+unpatched tree is green first; a red baseline scores every mutant as `dead`.
+Full flag list: `mutant-verify --help`.
 
 ## Output
 

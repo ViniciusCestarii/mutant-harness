@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# mutant-verify - build and test each generated mutant to find the real survivors.
+#
+#   mutant-verify --repo ~/src/bitcoin --patches results/src-script-interpreter-cpp-latest/out/patches
+#   mutant-verify --repo ~/src/bitcoin --patches .../patches --only mut-003,mut-007
+#
+# For every patch: git apply -> cmake --build -> ctest -> functional tests.
+# The first stage that fails decides the verdict; a mutant that survives all of
+# them is `live`. Everything runs on the host, in your clone, one at a time.
+set -euo pipefail
+
+REPO=""
+PATCH_DIR=""
+BUILD_DIR="build"
+JOBS="$( (command -v nproc >/dev/null && nproc) || echo 4)"
+OUT_FILE=""
+ONLY=""
+SKIP_FUNCTIONAL=0
+FUNCTIONAL_ARGS=()
+CTEST_ARGS=()
+RESUME=0
+BASELINE=0
+BUILD_TIMEOUT=""
+TEST_TIMEOUT=""
+FUNCTIONAL_TIMEOUT=""
+
+log()  { printf '\033[36m[mutant-verify]\033[0m %b\n' "$*" >&2; }
+warn() { printf '\033[33m[mutant-verify]\033[0m %b\n' "$*" >&2; }
+die()  { printf '\033[31m[mutant-verify]\033[0m %b\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat >&2 <<'EOF'
+mutant-verify - apply each mutant patch, build it, and run the test suite
+
+Usage:
+  mutant-verify --repo <core-clone> --patches <dir-or-patch> [options]
+
+Options:
+  --repo <path>          Bitcoin Core clone to mutate. Required. Must be clean.
+  --patches <path>       Patch directory (out/patches) or a single .patch file
+  --build-dir <dir>      CMake build dir, relative to the repo (default: build)
+  --jobs <n>             Parallelism for build/ctest/functional (default: nproc)
+  --only <ids>           Comma-separated mutant ids to run (e.g. mut-003,mut-007)
+  --skip-functional      Stop after ctest; survivors are reported as `live-unit`
+  --ctest-arg <arg>      Extra arg for ctest (repeatable)
+  --functional-arg <arg> Extra arg for test_runner.py (repeatable), e.g.
+                         --functional-arg feature_taproot.py
+  --baseline             Build and test the unpatched tree first and abort if it
+                         is not green (a red baseline makes every mutant "dead")
+  --resume               Skip mutants already recorded in the results file
+  --out <file>           Results JSONL (default: <patch-dir>/../verify/results.jsonl)
+  --build-timeout <d>    Kill a build after this long (e.g. 40m)
+  --test-timeout <d>     Kill ctest after this long
+  --func-timeout <d>     Kill the functional run after this long
+  -h, --help             This help
+
+Verdicts:
+  live         built, ctest passed, functional tests passed -> nothing noticed
+  live-unit    built and ctest passed, functional run skipped
+  dead         a test failed (`killed_by`: ctest | functional)
+  build-failed the mutant does not compile
+  apply-failed the patch does not apply to this checkout (wrong commit?)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --repo)           REPO="${2:?}"; shift 2 ;;
+        --patches)        PATCH_DIR="${2:?}"; shift 2 ;;
+        --build-dir)      BUILD_DIR="${2:?}"; shift 2 ;;
+        --jobs)           JOBS="${2:?}"; shift 2 ;;
+        --only)           ONLY="${2:?}"; shift 2 ;;
+        --skip-functional) SKIP_FUNCTIONAL=1; shift ;;
+        --ctest-arg)      CTEST_ARGS+=("${2:?}"); shift 2 ;;
+        --functional-arg) FUNCTIONAL_ARGS+=("${2:?}"); shift 2 ;;
+        --baseline)       BASELINE=1; shift ;;
+        --resume)         RESUME=1; shift ;;
+        --out)            OUT_FILE="${2:?}"; shift 2 ;;
+        --build-timeout)  BUILD_TIMEOUT="${2:?}"; shift 2 ;;
+        --test-timeout)   TEST_TIMEOUT="${2:?}"; shift 2 ;;
+        --func-timeout)   FUNCTIONAL_TIMEOUT="${2:?}"; shift 2 ;;
+        -h|--help)        usage; exit 0 ;;
+        *)                die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+# ----------------------------------------------------------------- args ----
+[[ -n "$REPO" ]]       || die "--repo is required"
+[[ -n "$PATCH_DIR" ]]  || die "--patches is required"
+[[ -d "$REPO/.git" ]]  || die "--repo $REPO is not a git clone"
+REPO="$(cd "$REPO" && pwd)"
+[[ "$JOBS" =~ ^[0-9]+$ ]] && (( JOBS > 0 )) || die "--jobs takes a positive number, got: $JOBS"
+
+# Collect the patches. A directory means "every mut-*.patch in it", sorted.
+PATCHES=()
+if [[ -d "$PATCH_DIR" ]]; then
+    PATCH_DIR="$(cd "$PATCH_DIR" && pwd)"
+    while IFS= read -r p; do PATCHES+=("$p"); done < <(find "$PATCH_DIR" -maxdepth 1 -name '*.patch' | sort)
+    RUN_ROOT="$(dirname "$PATCH_DIR")/verify"
+elif [[ -r "$PATCH_DIR" ]]; then
+    PATCH_DIR="$(cd "$(dirname "$PATCH_DIR")" && pwd)/$(basename "$PATCH_DIR")"
+    PATCHES=("$PATCH_DIR")
+    RUN_ROOT="$(dirname "$(dirname "$PATCH_DIR")")/verify"
+else
+    die "cannot read --patches $PATCH_DIR"
+fi
+[[ ${#PATCHES[@]} -gt 0 ]] || die "no .patch files under $PATCH_DIR"
+
+if [[ -n "$ONLY" ]]; then
+    KEEP=()
+    for p in "${PATCHES[@]}"; do
+        id="$(basename "$p" .patch)"
+        [[ ",$ONLY," == *",$id,"* ]] && KEEP+=("$p")
+    done
+    [[ ${#KEEP[@]} -gt 0 ]] || die "--only $ONLY matched no patch in $PATCH_DIR"
+    PATCHES=("${KEEP[@]}")
+fi
+
+mkdir -p "$RUN_ROOT/logs"
+RUN_ROOT="$(cd "$RUN_ROOT" && pwd)"
+[[ -n "$OUT_FILE" ]] || OUT_FILE="$RUN_ROOT/results.jsonl"
+mkdir -p "$(dirname "$OUT_FILE")"
+touch "$OUT_FILE"
+
+# The tree must be clean: we revert with `git checkout -- .` between mutants, and
+# a dirty tree makes both that revert and the "did this mutant do it?" question
+# unanswerable.
+# (untracked files are ignored: the build dir usually lives in the tree)
+if [[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]]; then
+    die "$REPO has uncommitted changes; commit or stash them first"
+fi
+[[ -d "$REPO/$BUILD_DIR" ]] || die "no build dir at $REPO/$BUILD_DIR (configure it first: cmake -B $BUILD_DIR)"
+
+FUNCTIONAL_RUNNER="$BUILD_DIR/test/functional/test_runner.py"
+if [[ "$SKIP_FUNCTIONAL" == 0 && ! -x "$REPO/$FUNCTIONAL_RUNNER" ]]; then
+    warn "no $FUNCTIONAL_RUNNER in $REPO (it appears after the first build)"
+fi
+
+# ------------------------------------------------------------- plumbing ----
+# Each stage runs with its own optional timeout and its output tee'd to a log,
+# so a verdict can always be traced back to the command that produced it.
+run_stage() {  # run_stage <log> <timeout-or-empty> <cmd...>
+    local log="$1" tmo="$2"; shift 2
+    local rc=0
+    {
+        printf '$ %s\n' "$*"
+        if [[ -n "$tmo" ]]; then
+            timeout --signal=TERM "$tmo" "$@" 2>&1
+        else
+            "$@" 2>&1
+        fi
+    } >>"$log" 2>&1 || rc=$?
+    return "$rc"
+}
+
+json_str() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
+
+record() {  # record <id> <status> <killed_by> <stage-rc> <seconds> <note>
+    local id="$1" status="$2" killed_by="$3" rc="$4" secs="$5" note="$6"
+    printf '{"id":%s,"status":%s,"killed_by":%s,"exit_code":%s,"seconds":%s,"note":%s,"log":%s,"finished_at":%s}\n' \
+        "$(json_str "$id")" "$(json_str "$status")" \
+        "$([[ -n "$killed_by" ]] && json_str "$killed_by" || printf 'null')" \
+        "$rc" "$secs" "$(json_str "$note")" "$(json_str "$RUN_ROOT/logs/$id.log")" \
+        "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" >>"$OUT_FILE"
+}
+
+already_done() {  # already_done <id>
+    grep -q "\"id\": *\"$1\"" "$OUT_FILE" 2>/dev/null
+}
+
+revert() {
+    git -C "$REPO" checkout -- . 2>/dev/null || true
+}
+
+trap 'echo; warn "interrupted; reverting $REPO"; revert; exit 130' INT TERM
+
+if [[ -n "$BUILD_TIMEOUT$TEST_TIMEOUT$FUNCTIONAL_TIMEOUT" ]]; then
+    command -v timeout >/dev/null || die "timeouts need coreutils timeout(1)"
+fi
+
+# ------------------------------------------------------------- baseline ----
+if [[ "$BASELINE" == 1 ]]; then
+    log "baseline: building and testing the unpatched tree"
+    blog="$RUN_ROOT/logs/baseline.log"; : >"$blog"
+    run_stage "$blog" "$BUILD_TIMEOUT" cmake --build "$REPO/$BUILD_DIR" -j "$JOBS" \
+        || die "baseline build failed; see $blog"
+    run_stage "$blog" "$TEST_TIMEOUT" ctest --test-dir "$REPO/$BUILD_DIR" -j "$JOBS" ${CTEST_ARGS[@]+"${CTEST_ARGS[@]}"} \
+        || die "baseline ctest failed; see $blog"
+    if [[ "$SKIP_FUNCTIONAL" == 0 ]]; then
+        run_stage "$blog" "$FUNCTIONAL_TIMEOUT" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" ${FUNCTIONAL_ARGS[@]+"${FUNCTIONAL_ARGS[@]}"} \
+            || die "baseline functional tests failed; see $blog"
+    fi
+    log "baseline is green"
+fi
+
+# ----------------------------------------------------------------- loop ----
+log "repo:    $REPO"
+log "build:   $BUILD_DIR (-j $JOBS)"
+log "results: $OUT_FILE"
+log "${#PATCHES[@]} patch(es) to verify"
+
+LIVE=0; DEAD=0; BROKEN=0; SKIPPED=0
+
+for patch in "${PATCHES[@]}"; do
+    id="$(basename "$patch" .patch)"
+
+    if [[ "$RESUME" == 1 ]] && already_done "$id"; then
+        log "$id: already recorded, skipping"
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
+    plog="$RUN_ROOT/logs/$id.log"; : >"$plog"
+    started=$(date +%s)
+    revert
+
+    if ! git -C "$REPO" apply --check "$patch" 2>>"$plog"; then
+        warn "$id: does not apply"
+        record "$id" apply-failed "" 1 $(( $(date +%s) - started )) "git apply --check failed"
+        BROKEN=$((BROKEN + 1))
+        continue
+    fi
+    git -C "$REPO" apply "$patch"
+
+    log "$id: building"
+    rc=0; run_stage "$plog" "$BUILD_TIMEOUT" cmake --build "$REPO/$BUILD_DIR" -j "$JOBS" || rc=$?
+    if (( rc != 0 )); then
+        warn "$id: build failed"
+        record "$id" build-failed "" "$rc" $(( $(date +%s) - started )) "cmake --build failed"
+        BROKEN=$((BROKEN + 1))
+        revert
+        continue
+    fi
+
+    log "$id: ctest"
+    rc=0; run_stage "$plog" "$TEST_TIMEOUT" ctest --test-dir "$REPO/$BUILD_DIR" -j "$JOBS" ${CTEST_ARGS[@]+"${CTEST_ARGS[@]}"} || rc=$?
+    if (( rc != 0 )); then
+        log "$id: \033[31mdead\033[0m (ctest)"
+        record "$id" dead ctest "$rc" $(( $(date +%s) - started )) "killed by the unit test suite"
+        DEAD=$((DEAD + 1))
+        revert
+        continue
+    fi
+
+    if [[ "$SKIP_FUNCTIONAL" == 1 ]]; then
+        log "$id: \033[32mlive-unit\033[0m (functional run skipped)"
+        record "$id" live-unit "" 0 $(( $(date +%s) - started )) "survived ctest; functional tests not run"
+        LIVE=$((LIVE + 1))
+        revert
+        continue
+    fi
+
+    log "$id: functional tests"
+    rc=0; run_stage "$plog" "$FUNCTIONAL_TIMEOUT" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" ${FUNCTIONAL_ARGS[@]+"${FUNCTIONAL_ARGS[@]}"} || rc=$?
+    if (( rc != 0 )); then
+        log "$id: \033[31mdead\033[0m (functional)"
+        record "$id" dead functional "$rc" $(( $(date +%s) - started )) "killed by the functional test suite"
+        DEAD=$((DEAD + 1))
+        revert
+        continue
+    fi
+
+    log "$id: \033[32mLIVE\033[0m - the whole suite passed"
+    record "$id" live "" 0 $(( $(date +%s) - started )) "survived ctest and the functional suite"
+    LIVE=$((LIVE + 1))
+    revert
+done
+
+revert
+
+# -------------------------------------------------------------- summary ----
+echo
+log "live: $LIVE   dead: $DEAD   not-runnable: $BROKEN   skipped: $SKIPPED"
+if command -v jq >/dev/null; then
+    jq -r '"  \(.id)  \(.status)\(if .killed_by then " (\(.killed_by))" else "" end)  \(.seconds)s"' "$OUT_FILE" >&2
+fi
+log "results: $OUT_FILE"
+log "logs:    $RUN_ROOT/logs/"
