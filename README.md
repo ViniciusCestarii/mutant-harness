@@ -1,9 +1,6 @@
 # mutant-harness
 
-> ⚠️ Disclaimer
-> 
-> This project was largely vibe-coded and has not been thoroughly reviewed by the author. Parts of the codebase, including this README, may contain mistakes, inconsistencies, or inaccurate information. Use it as-is and review the code before relying on it.
-
+> This project was largely vibe-coded
 
 Runs Claude Code inside a throwaway Docker container to read **one Bitcoin Core
 file**, work out what it is responsible for and who tests it, and plant a set of
@@ -59,7 +56,7 @@ Operator classes: `deletion`, `relocation`, `reorder`, `scope`, `boundary`,
 `condition`, `constant`, `state`, `error-handling`, `numeric`, `early-exit`,
 `concurrency`, `serialization`. `--ops` biases the run toward some of them.
 
-## Two things the harness checks itself
+## Three things the harness checks itself
 
 The agent's claims about its own patches are not evidence, so:
 
@@ -72,10 +69,17 @@ The agent's claims about its own patches are not evidence, so:
   generation. It reads the patches (not the descriptions of them), decides
   whether each compiles, whether any reachable input actually diverges, and
   searches the tests itself. Verdicts: `sneaky` (worth running),
-  `likely-killed`, `equivalent`, `invalid`. Skip it with `--no-review`.
+  `likely-killed`, `equivalent`, `invalid`. Off by default; turn it on with
+  `--review`.
+- **`mutant-verify` settles it by building and testing.** The review pass is
+  still a model's opinion; only running the suites proves a mutant is alive.
+  Point [`mutant-verify`](#verifying-them-mutant-verify) at your own clone and
+  the run's patches to get a real `live` / `dead` verdict per mutant:
 
-`sneaky` is the outcome you are looking for. Each one is a claim that a real bug
-of that shape would go undetected.
+  ```sh
+  mutant-verify --repo ~/src/bitcoin \
+      --patches results/src-script-interpreter-cpp-latest/out/patches
+  ```
 
 ## Install
 
@@ -97,6 +101,7 @@ mutant-harness --file src/net_processing.cpp --focus "headers sync"
 mutant-harness --file src/policy/feerate.cpp --lines 40-120
 mutant-harness --file src/txmempool.cpp --ops relocation,reorder,scope
 mutant-harness --file src/pubkey.cpp --model sonnet          # cheaper
+mutant-harness --file src/validation.cpp --review            # second-pass review of the mutants
 mutant-harness --file src/validation.cpp --update-core       # git fetch Core master first
 mutant-harness --file src/wallet/spend.cpp --repo ~/src/bitcoin   # your own clone
 mutant-harness --file src/validation.cpp --detach            # background
@@ -170,11 +175,11 @@ results/src-script-interpreter-cpp-20260821T190000Z/
 │   └── coverage.md            # the agent's map of what the tests cover
 └── out/
     ├── mutants.json           # the deliverable: mutants + harness validation
-    ├── mutants-reviewed.json  # the same, with a verdict on each   <- start here
+    ├── mutants-reviewed.json  # the same, with a verdict on each (only with --review)
     ├── patches/mut-001.patch  # one applicable diff per mutant
     ├── report.json            # mutants.json plus the agent's long-form notes
     ├── session.txt            # readable trace of what the agent did
-    ├── review.txt             # readable trace of the review pass
+    ├── review.txt             # readable trace of the review pass (only with --review)
     └── session.stream.jsonl   # raw stream-json log
 ```
 
@@ -187,7 +192,7 @@ finishes, so provenance does not depend on the model getting it right. Useful
 queries:
 
 ```sh
-# the ones worth building
+# the ones worth building (--review runs only)
 jq -r '.mutants[] | select(.verdict=="sneaky") | "\(.id) \(.operator) \(.title)"' out/mutants-reviewed.json
 
 # queue every patch that actually applies
@@ -216,9 +221,9 @@ jq '[.mutants[] | .operator] | group_by(.) | map({op: .[0], n: length})' out/mut
   scratch clone rather than the one you are working in.
 - **No build.** Compiling Core once per mutant would consume the entire budget,
   so the agent reasons about compilability instead and reports
-  `compile_confidence`; the reviewer re-checks it statically. Expect a small
-  fraction of mutants not to compile. Building them is your job, and it is the
-  cheap half of the work.
+  `compile_confidence`; with `--review` the reviewer re-checks it statically.
+  Expect a small fraction of mutants not to compile. `mutant-verify` builds them
+  for real, and that is the cheap half of the work.
 - **The BIP repo** is baked in at `/src/bips`. It is what makes the guesses
   smarter than a pattern match: before choosing sites, the agent works out which
   specs the file implements and aims at the lines enforcing a written MUST, so

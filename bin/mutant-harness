@@ -16,7 +16,7 @@ LINE_RANGE=""
 OPS=""
 OUT_ROOT="$PWD/results"
 MODEL="opus"
-REVIEW=1
+REVIEW=0
 REVIEW_MODEL=""
 FALLBACK_MODEL=""
 REPO_MOUNT=""
@@ -56,7 +56,7 @@ Options:
   --out <dir>          Output root (default: ./results); results land in
                        <dir>/<file-slug>-<timestamp>/
   --model <name>       Model for the mutator (default: opus)
-  --no-review          Skip the second-pass review of the mutants
+  --review             Run the second-pass review of the mutants (default: off)
   --review-model <n>   Model for the review pass (default: same as --model)
   --fallback-model <n> Fallback when the primary is overloaded
   --repo <path>        Mount a host Bitcoin Core clone instead of the baked-in one
@@ -87,7 +87,7 @@ while [[ $# -gt 0 ]]; do
         --ops)            OPS="${2:?}"; shift 2 ;;
         --out)            OUT_ROOT="${2:?}"; shift 2 ;;
         --model)          MODEL="${2:?}"; shift 2 ;;
-        --no-review)      REVIEW=0; shift ;;
+        --review)         REVIEW=1; shift ;;
         --review-model)   REVIEW_MODEL="${2:?}"; shift 2 ;;
         --fallback-model) FALLBACK_MODEL="${2:?}"; shift 2 ;;
         --repo)           REPO_MOUNT="${2:?}"; shift 2 ;;
