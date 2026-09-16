@@ -21,6 +21,8 @@ REVIEW_MODEL=""
 FALLBACK_MODEL=""
 REPO_MOUNT=""
 BIPS_REPO_MOUNT=""
+VERIFY_REPO=""
+VERIFY_ARGS=()
 REBUILD=0
 UPDATE_CORE=0
 UPDATE_BIPS=0
@@ -61,6 +63,11 @@ Options:
   --fallback-model <n> Fallback when the primary is overloaded
   --repo <path>        Mount a host Bitcoin Core clone instead of the baked-in one
   --bips-repo <path>   Mount a host bitcoin/bips clone instead of the baked-in one
+  --verify <path>      When the run finishes, build and test every mutant that
+                       applies and compiles, in this clone (mutant-verify). Must
+                       be clean and already configured; can take hours of machine time.
+  --verify-arg <arg>   Extra arg for that mutant-verify run (repeatable), e.g.
+                       --verify-arg --skip-functional
   --update-core        git fetch master inside the container first
   --update-bips        git fetch the bips repo too
   --rebuild            Rebuild the docker image first
@@ -92,6 +99,8 @@ while [[ $# -gt 0 ]]; do
         --fallback-model) FALLBACK_MODEL="${2:?}"; shift 2 ;;
         --repo)           REPO_MOUNT="${2:?}"; shift 2 ;;
         --bips-repo)      BIPS_REPO_MOUNT="${2:?}"; shift 2 ;;
+        --verify)         VERIFY_REPO="${2:?}"; shift 2 ;;
+        --verify-arg)     VERIFY_ARGS+=("${2:?}"); shift 2 ;;
         --update-core)    UPDATE_CORE=1; shift ;;
         --update-bips)    UPDATE_BIPS=1; shift ;;
         --rebuild)        REBUILD=1; shift ;;
@@ -119,6 +128,21 @@ if [[ -n "$APPLY_PATCH" ]]; then
     log "applied $(basename "$APPLY_PATCH") to $REPO_MOUNT"
     log "revert with: git -C $REPO_MOUNT checkout -- ."
     exit 0
+fi
+
+# --------------------------------------------------------------- verify ----
+# Everything --verify needs, checked now rather than when the run finishes. The
+# whole point of chaining is not to babysit it, and a clone found dirty an hour
+# later is the difference between a verified run and a wasted one.
+if [[ -n "$VERIFY_REPO" ]]; then
+    VERIFIER="$HERE/bin/mutant-verify"
+    [[ -x "$VERIFIER" ]] || die "--verify needs $VERIFIER"
+    [[ "$DETACH" == 0 && "$SHELL_MODE" == 0 ]] \
+        || die "--verify cannot be combined with --detach or --shell (it runs once the container exits)"
+    [[ -d "$VERIFY_REPO/.git" ]] || die "--verify $VERIFY_REPO is not a git clone"
+    [[ -z "$(git -C "$VERIFY_REPO" status --porcelain --untracked-files=no)" ]] \
+        || die "--verify $VERIFY_REPO has uncommitted changes; commit or stash them first"
+    VERIFY_REPO="$(cd "$VERIFY_REPO" && pwd)"
 fi
 
 command -v docker >/dev/null || die "docker not found on PATH"
@@ -305,6 +329,26 @@ if [[ -s "$MANIFEST" ]] && command -v jq >/dev/null && jq empty "$MANIFEST" 2>/d
     log "full report:      $OUT_DIR/report.json"
     log "trace:            $OUT_DIR/session.txt"
     log "apply one:        mutant-harness --apply $OUT_DIR/patches/mut-001.patch --repo <core-clone>"
+    [[ -n "$VERIFY_REPO" ]] \
+        || log "verify all:       mutant-verify --repo <core-clone> --patches $OUT_DIR/patches"
+
+    # Hand straight over to the verifier. Only the mutants that apply and
+    # compile: the others would each burn a build to prove what the manifest
+    # already says. Verdicts from --review are *not* filtered on - an
+    # `equivalent` call is still a model's opinion, and testing it is how you
+    # find out the model was wrong.
+    if [[ -n "$VERIFY_REPO" ]]; then
+        RUNNABLE="$(jq -r '[.mutants[]? | select(.apply_ok and (.compiles_ok != false)) | .id]
+                           | join(",")' "$MANIFEST")"
+        if [[ -z "$RUNNABLE" ]]; then
+            warn "no mutant both applies and compiles; nothing to verify"
+            exit 0
+        fi
+        echo
+        log "verifying ${RUNNABLE//,/ } in $VERIFY_REPO"
+        exec "$VERIFIER" --repo "$VERIFY_REPO" --patches "$OUT_DIR/patches" \
+             --only "$RUNNABLE" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"}
+    fi
     exit 0
 fi
 

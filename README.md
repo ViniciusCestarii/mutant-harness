@@ -79,7 +79,7 @@ The agent's claims about its own patches are not evidence, so:
   `--review`.
 - **`mutant-verify` settles it by building and testing.** The review pass is
   still a model's opinion; only running the suites proves a mutant is alive.
-  Point [`mutant-verify`](#verifying-them-mutant-verify) at your own clone and
+  Point [`mutant-verify`](#verifying-them-separately-mutant-verify) at your own clone and
   the run's patches to get a real `live` / `dead` verdict per mutant, with the
   tests that did the killing named and re-run once so a flake cannot pass for a
   kill:
@@ -113,6 +113,7 @@ mutant-harness --file src/pubkey.cpp --model sonnet          # cheaper
 mutant-harness --file src/validation.cpp --review            # second-pass review of the mutants
 mutant-harness --file src/validation.cpp --update-core       # git fetch Core master first
 mutant-harness --file src/wallet/spend.cpp --repo ~/src/bitcoin   # your own clone
+mutant-harness --file src/pow.cpp --verify ~/src/bitcoin     # then build and test the mutants
 mutant-harness --file src/validation.cpp --detach            # background
 mutant-harness --file src/validation.cpp --timeout 45m
 mutant-harness --shell --file src/validation.cpp             # poke around the container
@@ -132,7 +133,28 @@ git -C ~/src/bitcoin checkout -- .                  # revert
 
 `--apply` is a plain local `git apply` with a pre-check; it needs no container.
 
-### Verifying them: `mutant-verify`
+### Verifying them in the same command
+
+`--verify <core-clone>` hands the run straight to `mutant-verify` when the agent
+finishes, so generation and verification are one command:
+
+```sh
+mutant-harness --file src/pow.cpp --verify ~/src/bitcoin
+mutant-harness --file src/pow.cpp --verify ~/src/bitcoin --verify-arg --skip-functional
+```
+
+Only the mutants that apply *and* compile are queued - the rest would each burn
+a build to prove what the manifest already says. Verdicts from `--review` are
+not filtered on: an `equivalent` call is still a model's opinion, and testing it
+is how you find out the model was wrong. Results land in the run's own
+`out/verify/`, next to the patches they came from.
+
+The clone is checked for being a clean git tree before the agent starts rather
+than after, since the run is what you would otherwise have to throw away.
+`--verify-arg` forwards anything to that `mutant-verify` invocation, and the two
+cannot be combined with `--detach` or `--shell`.
+
+### Verifying them separately: `mutant-verify`
 
 `bin/mutant-verify` does the whole kill/survive sweep. For each patch, in your
 own clone, one at a time:
