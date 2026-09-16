@@ -6,6 +6,7 @@ set -uo pipefail
 
 TARGET_FILE="${TARGET_FILE:?TARGET_FILE not set}"
 BITCOIN_SRC="${BITCOIN_SRC:-/src/bitcoin}"
+BITCOIN_BUILD="${BITCOIN_BUILD:-/src/build}"
 BIPS_SRC="${BIPS_SRC:-/src/bips}"
 OUT_DIR="${OUT_DIR:-/out}"
 # The agent writes one full report plus one patch file per mutant. We validate
@@ -96,9 +97,68 @@ else
     OPS_TEXT="All operator classes below are available; pick per site whichever produces the most plausible bug."
 fi
 
+# -------------------------------------------------------- compile check ----
+# A Core build would eat the whole budget, but one translation unit is seconds,
+# and that is all it takes to stop guessing whether a mutant is valid C++.
+# `tu-check` needs a build dir configured against *this* commit. The baked-in
+# one matches unless the clone was swapped (--repo) or refreshed
+# (--update-core); CMake will not reuse a cache that points at another source
+# tree, so reconfigure into a throwaway dir in those cases.
+#
+# Then check the *unpatched* file. If it does not compile clean - a missing
+# generated header, a target this configure excluded - every mutant would be
+# stamped broken and the manifest would blame the agent for it. Disable the
+# check instead of reporting a fault it did not cause.
+COMPILE_CHECK=0
+setup_compile_check() {
+    command -v cmake >/dev/null && command -v tu-check >/dev/null || {
+        log "no compiler tooling in this image; compile check off"; return 0; }
+
+    local baked=""
+    [[ -r /src/build-commit.txt ]] && baked="$(cat /src/build-commit.txt)"
+    if [[ ! -f "$BITCOIN_BUILD/compile_commands.json" || "$baked" != "$CORE_COMMIT" ]]; then
+        log "build dir does not describe $CORE_COMMIT; reconfiguring (a few seconds) ..."
+        BITCOIN_BUILD=/tmp/mutant-build
+        if ! cmake -B "$BITCOIN_BUILD" -S "$BITCOIN_SRC" \
+                   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                   -DBUILD_GUI=OFF -DWITH_ZMQ=OFF -DENABLE_IPC=OFF \
+                   >/tmp/cmake-configure.log 2>&1; then
+            log "warning: cmake configure failed (see /tmp/cmake-configure.log); compile check off"
+            return 0
+        fi
+    fi
+
+    export BITCOIN_BUILD
+    if ! tu-check "$TARGET_FILE" >/tmp/tu-baseline.log 2>&1; then
+        log "warning: cannot compile-check $TARGET_FILE unpatched (a header, an"
+        log "         excluded target, or it does not build clean); compile check off"
+        log "         see /tmp/tu-baseline.log - every mutant would look broken"
+        return 0
+    fi
+
+    COMPILE_CHECK=1
+    log "compile check on: one translation unit, $BITCOIN_BUILD"
+}
+setup_compile_check
+
+if [[ "$COMPILE_CHECK" == "1" ]]; then
+    COMPILE_TEXT="Do not build the node: a Core build would consume your entire budget. You
+do not have to guess either. \`tu-check $TARGET_FILE\` compiles that one
+translation unit and nothing else, in seconds, and prints the compiler's own
+errors. Run it after every edit, before you take the diff, and fix or drop
+anything it rejects. The harness re-runs it on each patch after you exit, so a
+mutant that does not compile is recorded as such whatever you claim about it."
+else
+    COMPILE_TEXT="Do not build the node. A Core build would consume your entire budget, and no
+compile check is available in this run, so you must reason about compilability
+rather than check it - which is a hard constraint on what you may write: only
+mutants you are confident compile."
+fi
+
 # ------------------------------------------------------------- helpers ----
 export TARGET_FILE TARGET_PATH TARGET_LINES BITCOIN_SRC BIPS_SRC OUT_DIR \
-       REPORT_FILE PATCH_DIR MUTANT_COUNT RANGE_TEXT FOCUS_TEXT OPS_TEXT
+       REPORT_FILE PATCH_DIR MUTANT_COUNT RANGE_TEXT FOCUS_TEXT OPS_TEXT \
+       COMPILE_TEXT
 
 # Materialise a prompt with the run's paths substituted in.
 render_prompt() {
@@ -108,7 +168,7 @@ src, dst = sys.argv[1], sys.argv[2]
 text = open(src, encoding="utf-8").read()
 keys = ("TARGET_FILE", "TARGET_PATH", "TARGET_LINES", "BITCOIN_SRC", "BIPS_SRC",
         "OUT_DIR", "REPORT_FILE", "PATCH_DIR", "MUTANT_COUNT", "RANGE_TEXT",
-        "FOCUS_TEXT", "OPS_TEXT", "IN_MUTANTS", "OUT_REVIEWED")
+        "FOCUS_TEXT", "OPS_TEXT", "COMPILE_TEXT", "IN_MUTANTS", "OUT_REVIEWED")
 # Longest first so a shorter name never eats the prefix of a longer one.
 for k in sorted(keys, key=len, reverse=True):
     v = os.environ.get(k)
@@ -261,6 +321,60 @@ print(f"{len(mutants)} {ok} {dup} {len(orphans)}")
 PY
 }
 
+# ------------------------------------------------------ compile verify ----
+# `compile_confidence` is the agent's opinion of its own work, so treat it the
+# way apply_ok treats the rest: apply the patch, syntax-check the one file it
+# touched, revert, and stamp what actually happened. Only patches that apply are
+# worth checking. `compiles_ok` is the harness's answer; the agent cannot write
+# it. Cost is one translation unit per mutant.
+verify_compiles() {
+    python3 - "$REPORT_FILE" <<'PY'
+import json, os, subprocess, sys
+
+report_path = sys.argv[1]
+src    = os.environ["BITCOIN_SRC"]
+pdir   = os.environ["PATCH_DIR"]
+target = os.environ["TARGET_FILE"]
+
+with open(report_path, encoding="utf-8") as fh:
+    report = json.load(fh)
+mutants = report.get("mutants") or []
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", src, *args], capture_output=True, text=True)
+
+
+ok = bad = 0
+for m in mutants:
+    if not m.get("apply_ok"):
+        continue
+    patch = os.path.join(pdir, f"{str(m.get('id') or '').strip()}.patch")
+    if not os.path.isfile(patch):
+        continue
+    if git("apply", "--whitespace=nowarn", patch).returncode != 0:
+        continue
+
+    check = subprocess.run(["tu-check", target], capture_output=True, text=True)
+    git("checkout", "--", target)
+
+    # 2 means the check itself is unavailable for this file - not a verdict on
+    # the mutant, so leave the field absent rather than claim a result.
+    if check.returncode == 2:
+        break
+    m["compiles_ok"] = check.returncode == 0
+    if check.returncode == 0:
+        ok += 1
+    else:
+        bad += 1
+        m["compile_error"] = ((check.stdout or "") + (check.stderr or "")).strip()[:600]
+
+with open(report_path, "w", encoding="utf-8") as fh:
+    json.dump(report, fh, indent=2)
+print(f"{ok} {bad}")
+PY
+}
+
 # -------------------------------------------------------------- review ----
 # Second pass: a *fresh* Claude session that never saw the generation. It gets
 # the manifest, the patches, the file and the BIPs - and nothing from the first
@@ -367,6 +481,7 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
        --arg bipsdesc "$BIPS_DESC" \
        --arg model "$MODEL" \
        --argjson requested "$MUTANT_COUNT" \
+       --argjson compilecheck "$COMPILE_CHECK" \
        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        --argjson elapsed "$ELAPSED" \
        '. + {target: ((.target // {}) + {file: $file, file_lines: $filelines,
@@ -375,6 +490,7 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
              repo: ((.repo // {}) + {commit: $commit, head: $desc}),
              bips_repo: {commit: $bipscommit, head: $bipsdesc},
              harness: {model: $model, requested_mutants: $requested,
+                       compile_checked: ($compilecheck == 1),
                        finished_at: $ts, duration_seconds: $elapsed}}' \
        "$REPORT_FILE" > "$TMP" && mv "$TMP" "$REPORT_FILE"
 
@@ -384,6 +500,16 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
         log "patches: $N_TOTAL claimed, $N_OK apply cleanly, $N_DUP duplicates, $N_ORPHAN orphaned"
     else
         log "warning: patch validation failed; apply_ok fields are unreliable"
+    fi
+
+    if [[ "$COMPILE_CHECK" == "1" ]]; then
+        CSTATS="$(verify_compiles)"
+        if [[ -n "$CSTATS" ]]; then
+            read -r C_OK C_BAD <<< "$CSTATS"
+            log "compiles: $C_OK yes, $C_BAD no (one translation unit each)"
+        else
+            log "warning: compile check failed to run; compiles_ok is unset"
+        fi
     fi
 
     # mutants.json is the deliverable; report.json keeps everything the agent

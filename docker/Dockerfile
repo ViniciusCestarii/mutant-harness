@@ -10,7 +10,7 @@ ARG CLONE_DEPTH=1
 LABEL org.mutant-harness.kind="core-mutant-gen"
 # Bump when the image gains something a run now depends on; the harness rebuilds
 # any older image rather than failing inside the container.
-LABEL org.mutant-harness.version="1"
+LABEL org.mutant-harness.version="2"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -23,6 +23,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         less \
         python3 \
         procps \
+    # A compiler and Core's build dependencies, so one translation unit can be
+    # syntax-checked.
+        build-essential \
+        cmake \
+        pkgconf \
+        libboost-dev \
+        libevent-dev \
+        libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
@@ -44,12 +52,33 @@ RUN chmod -R a+rwX /src/bitcoin /src/bips \
     && mkdir -p /work /out /home/agent \
     && chmod -R a+rwX /work /out /home/agent
 
+COPY tu-check /usr/local/bin/tu-check
+# Configure the tree - configure only, no target is built. That is what writes
+# compile_commands.json and the generated headers a single translation unit
+# needs, in about a minute and a few MB rather than a full build. Non-fatal: if
+# it fails, the run still works and the entrypoint says the check is off. The
+# commit is recorded so the entrypoint can tell whether this build dir still
+# describes the tree it is pointed at.
+RUN chmod +x /usr/local/bin/tu-check; \
+    if cmake -B /src/build -S /src/bitcoin \
+             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+             -DBUILD_GUI=OFF \
+             -DWITH_ZMQ=OFF \
+             -DENABLE_IPC=OFF; then \
+        git -C /src/bitcoin rev-parse HEAD > /src/build-commit.txt; \
+        chmod -R a+rwX /src/build /src/build-commit.txt; \
+    else \
+        echo 'cmake configure failed; tu-check will be unavailable at run time' >&2; \
+        rm -rf /src/build; \
+    fi
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV HOME=/home/agent \
     CLAUDE_CONFIG_DIR=/home/agent/.claude \
     BITCOIN_SRC=/src/bitcoin \
+    BITCOIN_BUILD=/src/build \
     BIPS_SRC=/src/bips \
     GIT_CONFIG_GLOBAL=/home/agent/.gitconfig
 

@@ -49,12 +49,13 @@ Each mutant is a one-change patch against a known Core commit, carrying:
 | `kill_prediction` | the test that would catch it, or `none found` |
 | `plausibility` | why a reviewer could miss this line |
 | `equivalence_risk` | the agent's own argument that the mutant is a no-op |
+| `compiles_ok` | whether the mutated translation unit actually compiles, checked by the harness |
 
 Operator classes: `deletion`, `relocation`, `reorder`, `scope`, `boundary`,
 `condition`, `constant`, `state`, `error-handling`, `numeric`, `early-exit`,
 `concurrency`, `serialization`. `--ops` biases the run toward some of them.
 
-## Three things the harness checks itself
+## What the harness checks itself
 
 The agent's claims about its own patches are not evidence, so:
 
@@ -63,6 +64,13 @@ The agent's claims about its own patches are not evidence, so:
   patch touches any file other than the target or changes nothing at all.
   `patch_sha256` hashes only the `+`/`-` lines, so `duplicate_of` catches two
   mutants that are secretly the same edit.
+- **Every patch is compiled.** Not the whole node, only the one translation unit it
+  touches, via `tu-check` against a build dir configured in the image. The
+  harness applies the patch, syntax-checks the file, reverts, and stamps
+  `compiles_ok` plus the compiler's own `compile_error`. The agent runs the same
+  command while it works, so a mutant that does not compile should never reach
+  the manifest, and one that does is caught here rather than by a full build
+  later.
 - **A second agent reviews the mutants** in a fresh session that never saw the
   generation. It reads the patches (not the descriptions of them), decides
   whether each compiles, whether any reachable input actually diverges, and
@@ -85,7 +93,8 @@ The agent's claims about its own patches are not evidence, so:
 
 ```sh
 git clone <this repo> && cd mutant-harness
-./bin/mutant-harness --build-only     # ~5 min: clones Core and the BIP repo into the image
+./bin/mutant-harness --build-only     # ~6 min: clones Core and the BIPs, installs a
+                                      # compiler, and configures the tree for tu-check
 ln -s "$PWD/bin/mutant-harness" ~/.local/bin/mutant-harness
 ln -s "$PWD/bin/mutant-verify"  ~/.local/bin/mutant-verify
 ```
@@ -206,16 +215,19 @@ results/src-script-interpreter-cpp-20260821T190000Z/
 `results/<file-slug>-latest` symlinks to the most recent run for that file.
 
 The harness stamps `target`, `repo.commit`, `repo.head`, `bips_repo.commit`, and
-`harness.{model,requested_mutants,finished_at,duration_seconds}` after the agent
-finishes, so provenance does not depend on the model getting it right. Useful
-queries:
+`harness.{model,requested_mutants,compile_checked,finished_at,duration_seconds}`
+after the agent finishes, so provenance does not depend on the model getting it
+right. Useful queries:
 
 ```sh
 # the ones worth building (--review runs only)
 jq -r '.mutants[] | select(.verdict=="sneaky") | "\(.id) \(.operator) \(.title)"' out/mutants-reviewed.json
 
-# queue every patch that actually applies
-jq -r '.mutants[] | select(.apply_ok) | .patch' out/mutants.json
+# queue every patch that applies and compiles
+jq -r '.mutants[] | select(.apply_ok and .compiles_ok != false) | .patch' out/mutants.json
+
+# the ones that do not compile, and why
+jq -r '.mutants[] | select(.compiles_ok == false) | "\(.id): \(.compile_error)"' out/mutants.json
 
 # what the agent thinks is untested
 jq -r '.coverage_map.thinly_covered[]' out/mutants.json
@@ -238,11 +250,22 @@ jq '[.mutants[] | .operator] | group_by(.) | map({op: .[0], n: length})' out/mut
   exists. If you pass `--repo`, the agent is editing *your* clone in place -
   the harness reverts the target file before and after the run, but use a
   scratch clone rather than the one you are working in.
-- **No build.** Compiling Core once per mutant would consume the entire budget,
-  so the agent reasons about compilability instead and reports
-  `compile_confidence`; with `--review` the reviewer re-checks it statically.
-  Expect a small fraction of mutants not to compile. `mutant-verify` builds them
-  for real, and that is the cheap half of the work.
+- **One translation unit, not a build.** Linking Core once per mutant would
+  consume the entire budget, but a single `.cpp` type-checks in seconds, and
+  that is all it takes to know whether an edit is valid C++. The image ships a
+  *configured* tree (`cmake` configure only, no target built) and `tu-check`,
+  which reads the compiler command CMake recorded for the file out of
+  `compile_commands.json` and re-runs it with `-fsyntax-only`. The agent runs it
+  after every edit; the harness re-runs it on each finished patch and stamps
+  `compiles_ok`. The cost is a bigger image - a compiler, Boost and libevent
+  headers, and a minute of configure at build time.
+  If the clone is swapped (`--repo`) or refreshed (`--update-core`), the build
+  dir no longer describes the tree, so the entrypoint reconfigures once into a
+  throwaway dir. If that fails, or the *unpatched* file does not syntax-check on
+  its own, the check turns itself off and says so rather than stamping every
+  mutant broken for a fault the agent did not cause - `harness.compile_checked`
+  records which way the run went, and the agent is told to reason about
+  compilability instead.
 - **The BIP repo** is baked in at `/src/bips`. It is what makes the guesses
   smarter than a pattern match: before choosing sites, the agent works out which
   specs the file implements and aims at the lines enforcing a written MUST, so

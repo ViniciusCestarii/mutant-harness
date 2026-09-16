@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Syntax-check one Bitcoin Core translation unit.
+
+    tu-check src/script/interpreter.cpp
+
+Exit codes:
+  0  it compiles
+  1  it does not; the compiler's own output is on stdout
+  2  no check is available here - no configured build dir, or the file is not a
+     translation unit (a header, or a target this build excludes)
+
+BITCOIN_SRC and BITCOIN_BUILD locate the tree and the configured build dir.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+
+def load_entry(db_path, build, want):
+    with open(db_path, encoding="utf-8") as fh:
+        db = json.load(fh)
+    for e in db:
+        f = e.get("file", "")
+        f = f if os.path.isabs(f) else os.path.join(e.get("directory", build), f)
+        if os.path.realpath(f) == want:
+            return e
+    return None
+
+
+def syntax_only(args):
+    """The recorded command, minus the parts that write an object file.
+
+    A precompiled header is dropped too: CMake records it as an `-include` of a
+    file that only exists once the target has been built, and we have not built
+    anything.
+    """
+    out, i, n = [], 0, len(args)
+    while i < n:
+        a = args[i]
+        # The object file and the dependency-file bookkeeping name outputs we do
+        # not want written. Each of these takes the next argument with it.
+        if a in ("-o", "-MF", "-MT", "-MQ"):
+            i += 2
+            continue
+        if a == "-c" or a.startswith("-MD") or a.startswith("-MMD"):
+            i += 1
+            continue
+        if a.startswith("-o") and len(a) > 2:
+            i += 1
+            continue
+        # The `-include` and its path have to go together, or the flag is left
+        # dangling and eats the next argument - eventually the source file.
+        if a == "-include" and i + 1 < n and "cmake_pch" in args[i + 1]:
+            i += 2
+            continue
+        if a == "-Winvalid-pch" or "cmake_pch" in a:
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    out.append("-fsyntax-only")
+    return out
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: tu-check <file-in-core-tree>", file=sys.stderr)
+        return 2
+
+    src = os.environ.get("BITCOIN_SRC", "/src/bitcoin")
+    build = os.environ.get("BITCOIN_BUILD", "/src/build")
+    db_path = os.path.join(build, "compile_commands.json")
+    if not os.path.isfile(db_path):
+        print(f"tu-check: no compile database at {db_path}", file=sys.stderr)
+        return 2
+
+    target = argv[1]
+    want = os.path.realpath(target if os.path.isabs(target)
+                            else os.path.join(src, target))
+
+    entry = load_entry(db_path, build, want)
+    if entry is None:
+        print(f"tu-check: {target} is not a translation unit in this build "
+              f"(no entry in {db_path})", file=sys.stderr)
+        return 2
+
+    args = entry.get("arguments") or shlex.split(entry["command"])
+    proc = subprocess.run(syntax_only(args),
+                          cwd=entry.get("directory", build),
+                          capture_output=True, text=True)
+    output = (proc.stdout + proc.stderr).strip()
+    if output:
+        print(output)
+    return 0 if proc.returncode == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

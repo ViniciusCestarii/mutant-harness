@@ -34,9 +34,7 @@ Do not modify any file other than `$TARGET_FILE`. A patch that touches a second
 file is discarded by the harness. Do not modify tests to make a mutant survive:
 the mutant must survive the tests as they are.
 
-Do not build the node. A Core build would consume your entire budget, so you
-must reason about compilability rather than check it - which is a hard
-constraint on what you may write: only mutants you are confident compile.
+$COMPILE_TEXT
 
 ## Method
 
@@ -77,7 +75,8 @@ Work in this order and do not skip ahead.
 5. **Write the mutants, one at a time**, using the loop below.
 
 6. **Adversarially review your own mutants** before you finish. For each one
-   ask: does it still compile (types, references, control flow, every path
+   ask: does it still compile (`tu-check` if you have it, otherwise types,
+   references, control flow, every path
    returning a value); does it actually change behaviour on some reachable
    input, or is it an equivalent mutant dressed up; is there a test that
    obviously kills it. Drop the ones that fail. $MUTANT_COUNT is a target, not a
@@ -91,9 +90,11 @@ each other. For each mutant, with `mut-001`, `mut-002`, ... as the id:
 
 1. `git -C $BITCOIN_SRC status --porcelain` - confirm it is clean.
 2. Edit `$TARGET_PATH` to introduce exactly **one** mutant.
-3. `git -C $BITCOIN_SRC diff -- $TARGET_FILE > $PATCH_DIR/mut-001.patch`
-4. `git -C $BITCOIN_SRC checkout -- $TARGET_FILE` - revert, always.
-5. Confirm the patch is non-empty and that the tree is clean again.
+3. `tu-check $TARGET_FILE` - if it is available and the compiler complains, fix
+   the edit or abandon the site. Do not write a patch it rejects.
+4. `git -C $BITCOIN_SRC diff -- $TARGET_FILE > $PATCH_DIR/mut-001.patch`
+5. `git -C $BITCOIN_SRC checkout -- $TARGET_FILE` - revert, always.
+6. Confirm the patch is non-empty and that the tree is clean again.
 
 One mutant per patch. Never leave the tree dirty between mutants, and never let
 mutant N's edit end up inside mutant N+1's diff.
@@ -155,7 +156,8 @@ review more easily.
   an input that behaves differently, throw it away.
 - **Compiles.** No undeclared names, no type mismatches, no missing returns, no
   use-after-move you introduced by relocating a `std::move`. When you relocate a
-  statement, check every name it uses is still in scope at the new place.
+  statement, check every name it uses is still in scope at the new place and
+  then let `tu-check` settle it, if this run has it.
 - **Plausible.** It should read like a normal line of Core, in the style of the
   surrounding code. If the diff makes a reviewer stop, it is a bad mutant.
 - **Consequential.** Prefer mutants that break a written rule (a BIP MUST, a
@@ -171,7 +173,8 @@ that file: no markdown fences, no prose. The patches live in `$PATCH_DIR`, one
 per mutant, named `<id>.patch`.
 
 Do not write `target`, `repo`, `bips_repo`, `harness`, `patch`, `apply_ok`,
-`files_touched`, `lines_added`, `lines_removed`, `patch_sha256`, or
+`files_touched`, `lines_added`, `lines_removed`, `patch_sha256`, `compiles_ok`,
+`compile_error`, or
 `duplicate_of`: the harness stamps those itself after you exit by re-checking
 every patch against git, and anything you put there is overwritten. Write the
 fields below and nothing else.
@@ -209,7 +212,7 @@ fields below and nothing else.
         "where_you_looked": "the test paths and greps you actually ran"
       },
       "plausibility": "why a human could write this line and a reviewer could miss it",
-      "compile_confidence": "high | medium | low, plus what you checked (names in scope, types, all paths return)",
+      "compile_confidence": "high | medium | low, plus what you checked - say so if tu-check accepted it, otherwise what you verified by reading (names in scope, types, all paths return)",
       "equivalence_risk": "the strongest argument that this mutant changes nothing observable"
     }
   ],

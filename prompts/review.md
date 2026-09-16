@@ -6,7 +6,7 @@ plausible bug that the test suite would miss. Their manifest is in
 and you owe their author nothing. Your only job is to decide, mutant by mutant,
 whether it is worth the machine time to compile and test.
 
-Running a mutant is expensive: a Core build plus a test run each. An equivalent
+Running a mutant is expensive: a full Core build plus a test run each. An equivalent
 mutant burns that for a guaranteed non-result, a mutant that does not compile
 burns it for nothing at all, and a mutant the first unit test kills teaches
 nobody anything. Your verdicts are what decides where that budget goes.
@@ -36,12 +36,15 @@ For each mutant, in order:
    function does: the enclosing scope, the callers, what the early returns skip.
 
 2. **Decide whether it compiles.** This is the cheapest way to disqualify one.
-   Check every name the mutated code uses is declared and in scope at its new
-   position, that types still match, that every path still returns a value, that
-   nothing is used after a `std::move` the relocation introduced, that a
-   relocated statement did not escape the lifetime of what it references, and
-   that lock annotations are not obviously violated. Reason statically; do not
-   attempt a build.
+   If the mutant carries `compiles_ok`, that is the compiler's answer, not a
+   claim: the harness applied the patch and syntax-checked the translation unit.
+   Take it, and spend nothing more on the question - a `false` there makes the
+   mutant `invalid`, and `compile_error` says why.
+   Where the field is absent no check was available, so read for it instead:
+   every name the mutated code uses declared and in scope at its new position,
+   types still matching, every path still returning a value, nothing used after
+   a `std::move` the relocation introduced, no relocated statement escaping the
+   lifetime of what it references, lock annotations not obviously violated.
 
 3. **Decide whether it changes behaviour.** Construct, concretely, an input that
    reaches the mutated line and diverges: which message, transaction, block,
@@ -81,8 +84,9 @@ settled it.
   appear in the output exactly once, with all of its original fields unchanged.
 - Read every line you cite. Cite nothing from memory, and do not lean on what
   you recall about Core - the files in front of you are the only authority.
-- A mutant the harness already marked `"apply_ok": false` is `invalid`; say so
-  in `verdict_reason` and move on without spending budget on it.
+- A mutant the harness already marked `"apply_ok": false` or
+  `"compiles_ok": false` is `invalid`; say so in `verdict_reason` and move on
+  without spending budget on it.
 - If a mutant is marked `duplicate_of`, judge it on its merits but say in
   `verdict_reason` that it duplicates that id.
 
