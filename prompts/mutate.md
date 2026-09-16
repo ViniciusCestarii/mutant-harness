@@ -221,9 +221,31 @@ fields below and nothing else.
 ```
 
 `severity_if_undetected` means the consequence if this bug shipped, not the
-effort to write it: `critical` = chain split or fund loss; `high` = validation
-gap an attacker can reach; `medium` = real misbehaviour with bounded impact;
-`low` = interop or robustness; `info` = cosmetic or unreachable-in-practice.
+effort to write it or how hard the mutant is to kill. Label by the worst
+realistic outcome, judged from `trigger`: if no attacker or normal peer can
+reach the line, the severity drops however bad the code path looks.
+
+- `critical` - consensus or funds. The node accepts a block or transaction it
+  must reject, or rejects one it must accept, so it forks off the network or
+  follows a chain the rest of the network does not; or money is spendable,
+  unspendable, or misattributed. Also: remote crash or memory corruption
+  reachable from unauthenticated p2p input, or a key or seed exposed.
+- `high` - a validation, policy, or DoS gap an attacker can reach on purpose,
+  without splitting consensus. Cheap resource exhaustion (unbounded memory,
+  CPU, disk), a policy rule an attacker bypasses to relay what the node should
+  drop, eclipse or peer-selection manipulation, a local crash on hostile input.
+  Costly to the node, but the chain itself stays intact.
+- `medium` - real misbehaviour with bounded impact and no clear attacker path:
+  wrong fee or size accounting, a peer scored or banned wrongly, state that
+  drifts until restart, an RPC that returns wrong values. It hurts this node
+  or its users, not the network.
+- `low` - interop or robustness. Deviation from a documented format or message
+  that peers tolerate, a log or error message that misleads an operator, a
+  missing check that only fires on input the node already rejects, degraded
+  behaviour under conditions that resolve by themselves.
+
+When a mutant sits between two levels, pick the lower one and explain the case
+for the higher one in `intent`.
 
 `id` is `mut-001`, `mut-002`, ... and MUST match the patch filename exactly.
 
