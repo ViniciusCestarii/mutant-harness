@@ -72,7 +72,9 @@ The agent's claims about its own patches are not evidence, so:
 - **`mutant-verify` settles it by building and testing.** The review pass is
   still a model's opinion; only running the suites proves a mutant is alive.
   Point [`mutant-verify`](#verifying-them-mutant-verify) at your own clone and
-  the run's patches to get a real `live` / `dead` verdict per mutant:
+  the run's patches to get a real `live` / `dead` verdict per mutant, with the
+  tests that did the killing named and re-run once so a flake cannot pass for a
+  kill:
 
   ```sh
   mutant-verify --repo ~/src/bitcoin \
@@ -137,6 +139,7 @@ the next mutant either way.
 mutant-verify --repo ~/src/bitcoin --patches results/src-script-interpreter-cpp-latest/out/patches
 mutant-verify --repo ~/src/bitcoin --patches .../patches --only mut-003,mut-007
 mutant-verify --repo ~/src/bitcoin --patches .../patches --skip-functional   # fast first pass
+mutant-verify --repo ~/src/bitcoin --patches .../patches --no-baseline       # tree is already known green
 mutant-verify --repo ~/src/bitcoin --patches .../patches --resume            # after a Ctrl-C
 mutant-verify --repo ~/src/bitcoin --patches .../patches \
     --functional-arg feature_taproot.py --functional-arg p2p_segwit.py
@@ -146,22 +149,41 @@ mutant-verify --repo ~/src/bitcoin --patches .../patches \
 | --- | --- |
 | `live` | built, `ctest` green, functional suite green - **nothing noticed** |
 | `live-unit` | survived `ctest`; functional run was skipped |
-| `dead` | a suite failed; `killed_by` is `ctest` or `functional` |
+| `dead` | a suite failed twice; `killed_by` is `ctest` or `functional` and `killed_tests` names the tests |
 | `build-failed` | the mutant does not compile |
 | `apply-failed` | the patch does not apply to this checkout (wrong commit?) |
+
+A failing suite is not taken at face value. Core's tests flake, and a false
+`dead` throws away the only result worth having, so `mutant-verify` reads the
+names of the tests that failed out of the suite's own output and re-runs **just
+those** once, not a second full suite. Only a second failure is a
+kill; a test that passes the second time is recorded in `flaky` and the mutant
+carries on to the next stage. A failure no test claims (a crashed runner, a
+timeout) is not re-run and stands as a kill, with `killed_tests` null.
+
+`killed_tests` is also what makes a verdict checkable by eye: a feerate mutant
+killed by `feerate_tests` reads as a real kill, one killed by `p2p_permissions`
+reads as something to go look at.
 
 Results are appended as JSONL to `out/verify/results.jsonl`, with the full
 output of every stage under `out/verify/logs/<id>.log`:
 
 ```sh
 jq -r 'select(.status=="live") | .id' out/verify/results.jsonl
+
+# what killed each mutant - does it make sense that it did?
+jq -r 'select(.killed_tests) | "\(.id)  \(.killed_by): \(.killed_tests | join(", "))"' out/verify/results.jsonl
+
+# tests that flaked during the run
+jq -r 'select(.flaky) | "\(.id) \(.flaky | join(","))"' out/verify/results.jsonl
 ```
 
 The clone must have no uncommitted tracked changes (untracked files, `build/`
 included, are ignored) and must already be configured - `mutant-verify` builds,
-it does not run `cmake -B`. Use `--baseline` on a fresh clone to prove the
-unpatched tree is green first; a red baseline scores every mutant as `dead`.
-Full flag list: `mutant-verify --help`.
+it does not run `cmake -B`. It proves the unpatched tree is green before it
+starts, because a red baseline scores every mutant as `dead`; that costs one
+suite run against the N you are about to do anyway. `--no-baseline` skips it,
+and `--resume` skips it by default. Full flag list: `mutant-verify --help`.
 
 ## Output
 

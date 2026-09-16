@@ -7,6 +7,8 @@
 # For every patch: git apply -> cmake --build -> ctest -> functional tests.
 # The first stage that fails decides the verdict; a mutant that survives all of
 # them is `live`. Everything runs on the host, in your clone, one at a time.
+# A failing suite names the tests that failed and re-runs just those once, so a
+# flaky test cannot quietly score a survivor as `dead`.
 set -euo pipefail
 
 REPO=""
@@ -19,7 +21,8 @@ SKIP_FUNCTIONAL=0
 FUNCTIONAL_ARGS=()
 CTEST_ARGS=()
 RESUME=0
-BASELINE=0
+BASELINE=1
+BASELINE_SET=0
 BUILD_TIMEOUT=""
 TEST_TIMEOUT=""
 FUNCTIONAL_TIMEOUT=""
@@ -45,6 +48,8 @@ Options:
   --ctest-arg <arg>      Extra arg for ctest (repeatable)
   --functional-arg <arg> Extra arg for test_runner.py (repeatable), e.g.
                          --functional-arg feature_taproot.py
+  --no-baseline          Skip the baseline run (default: on, and off under
+                         --resume unless you pass --baseline explicitly)
   --baseline             Build and test the unpatched tree first and abort if it
                          is not green (a red baseline makes every mutant "dead")
   --resume               Skip mutants already recorded in the results file
@@ -57,9 +62,13 @@ Options:
 Verdicts:
   live         built, ctest passed, functional tests passed -> nothing noticed
   live-unit    built and ctest passed, functional run skipped
-  dead         a test failed (`killed_by`: ctest | functional)
+  dead         a test failed twice (`killed_by`: ctest | functional, and
+               `killed_tests`: the tests that named it)
   build-failed the mutant does not compile
   apply-failed the patch does not apply to this checkout (wrong commit?)
+
+A suite failure re-runs only the tests that failed. Passing the second time is
+recorded in `flaky` and the mutant lives on to the next stage.
 EOF
 }
 
@@ -73,7 +82,8 @@ while [[ $# -gt 0 ]]; do
         --skip-functional) SKIP_FUNCTIONAL=1; shift ;;
         --ctest-arg)      CTEST_ARGS+=("${2:?}"); shift 2 ;;
         --functional-arg) FUNCTIONAL_ARGS+=("${2:?}"); shift 2 ;;
-        --baseline)       BASELINE=1; shift ;;
+        --baseline)       BASELINE=1; BASELINE_SET=1; shift ;;
+        --no-baseline)    BASELINE=0; BASELINE_SET=1; shift ;;
         --resume)         RESUME=1; shift ;;
         --out)            OUT_FILE="${2:?}"; shift 2 ;;
         --build-timeout)  BUILD_TIMEOUT="${2:?}"; shift 2 ;;
@@ -90,6 +100,10 @@ done
 [[ -d "$REPO/.git" ]]  || die "--repo $REPO is not a git clone"
 REPO="$(cd "$REPO" && pwd)"
 [[ "$JOBS" =~ ^[0-9]+$ ]] && (( JOBS > 0 )) || die "--jobs takes a positive number, got: $JOBS"
+
+# Resuming means the baseline already ran, and re-running a whole suite before
+# picking up where a Ctrl-C left off is the opposite of what --resume is for.
+if [[ "$RESUME" == 1 && "$BASELINE_SET" == 0 ]]; then BASELINE=0; fi
 
 # Collect the patches. A directory means "every mut-*.patch in it", sorted.
 PATCHES=()
@@ -155,12 +169,60 @@ run_stage() {  # run_stage <log> <timeout-or-empty> <cmd...>
 
 json_str() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
 
+json_arr() {  # json_arr <item...> - JSON array, or null when there is nothing
+    (( $# )) || { printf 'null'; return; }
+    printf '%s\n' "$@" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().splitlines()))'
+}
+
+# Which tests actually failed, read back out of what the stage just appended to
+# the log. `killed_by: ctest` alone cannot be sanity-checked; the names can - a
+# feerate mutant killed by a p2p test is a flake, not a kill.
+log_mark() { wc -c <"$1" | tr -d ' '; }
+
+failed_tests() {  # failed_tests <log> <mark> <ctest|functional>
+    local log="$1" mark="$2" kind="$3"
+    case "$kind" in
+        ctest)
+            tail -c "+$((mark + 1))" "$log" \
+                | sed -n '/The following tests FAILED:/,$p' \
+                | sed -nE 's/^[[:space:]]*[0-9]+ - ([^ ]+).*/\1/p' | sort -u
+            ;;
+        functional)
+            # test_runner.py ends with a table: "<script.py> | ✖ Failed | 12 s",
+            # closed by an ALL row that is the total, not a test.
+            tail -c "+$((mark + 1))" "$log" \
+                | awk -F'|' 'NF > 2 && $2 ~ /Failed/ {
+                       gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1)
+                       if ($1 != "ALL" && $1 != "") print $1 }' | sort -u
+            ;;
+    esac
+}
+
+# Core's suites flake, and a false `dead` discards the one result worth having.
+# So a failure is re-run - but only the tests that named themselves, which costs
+# seconds rather than a second full suite. A failure we cannot attribute to any
+# test is not re-run and stands as a kill: there is nothing cheap to repeat, and
+# forgiving it would forgive a real one.
+rerun_failed() {  # rerun_failed <log> <timeout> <ctest|functional> <name...>
+    local log="$1" tmo="$2" kind="$3"; shift 3
+    printf '\n--- re-running %s failure(s) once: %s ---\n' "$kind" "$*" >>"$log"
+    if [[ "$kind" == ctest ]]; then
+        # --rerun-failed reads the build dir's own list and ignores other
+        # filters, so CTEST_ARGS is deliberately not passed here.
+        run_stage "$log" "$tmo" ctest --test-dir "$REPO/$BUILD_DIR" -j "$JOBS" --rerun-failed
+    else
+        run_stage "$log" "$tmo" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" "$@"
+    fi
+}
+
 record() {  # record <id> <status> <killed_by> <stage-rc> <seconds> <note>
     local id="$1" status="$2" killed_by="$3" rc="$4" secs="$5" note="$6"
-    printf '{"id":%s,"status":%s,"killed_by":%s,"exit_code":%s,"seconds":%s,"note":%s,"log":%s,"finished_at":%s}\n' \
+    printf '{"id":%s,"status":%s,"killed_by":%s,"killed_tests":%s,"exit_code":%s,"seconds":%s,"flaky":%s,"note":%s,"log":%s,"finished_at":%s}\n' \
         "$(json_str "$id")" "$(json_str "$status")" \
         "$([[ -n "$killed_by" ]] && json_str "$killed_by" || printf 'null')" \
-        "$rc" "$secs" "$(json_str "$note")" "$(json_str "$RUN_ROOT/logs/$id.log")" \
+        "$(json_arr ${KILLED_TESTS[@]+"${KILLED_TESTS[@]}"})" \
+        "$rc" "$secs" "$(json_arr ${FLAKY[@]+"${FLAKY[@]}"})" \
+        "$(json_str "$note")" "$(json_str "$RUN_ROOT/logs/$id.log")" \
         "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" >>"$OUT_FILE"
 }
 
@@ -184,11 +246,27 @@ if [[ "$BASELINE" == 1 ]]; then
     blog="$RUN_ROOT/logs/baseline.log"; : >"$blog"
     run_stage "$blog" "$BUILD_TIMEOUT" cmake --build "$REPO/$BUILD_DIR" -j "$JOBS" \
         || die "baseline build failed; see $blog"
-    run_stage "$blog" "$TEST_TIMEOUT" ctest --test-dir "$REPO/$BUILD_DIR" -j "$JOBS" ${CTEST_ARGS[@]+"${CTEST_ARGS[@]}"} \
-        || die "baseline ctest failed; see $blog"
+
+    bmark=$(log_mark "$blog")
+    if ! run_stage "$blog" "$TEST_TIMEOUT" ctest --test-dir "$REPO/$BUILD_DIR" -j "$JOBS" ${CTEST_ARGS[@]+"${CTEST_ARGS[@]}"}; then
+        bfailed=()
+        while IFS= read -r t; do bfailed+=("$t"); done < <(failed_tests "$blog" "$bmark" ctest)
+        (( ${#bfailed[@]} )) || die "baseline ctest failed; see $blog"
+        rerun_failed "$blog" "$TEST_TIMEOUT" ctest "${bfailed[@]}" \
+            || die "baseline ctest failed twice (${bfailed[*]}); see $blog"
+        warn "baseline: ${bfailed[*]} failed then passed on re-run - flaky, not a kill"
+    fi
+
     if [[ "$SKIP_FUNCTIONAL" == 0 ]]; then
-        run_stage "$blog" "$FUNCTIONAL_TIMEOUT" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" ${FUNCTIONAL_ARGS[@]+"${FUNCTIONAL_ARGS[@]}"} \
-            || die "baseline functional tests failed; see $blog"
+        bmark=$(log_mark "$blog")
+        if ! run_stage "$blog" "$FUNCTIONAL_TIMEOUT" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" ${FUNCTIONAL_ARGS[@]+"${FUNCTIONAL_ARGS[@]}"}; then
+            bfailed=()
+            while IFS= read -r t; do bfailed+=("$t"); done < <(failed_tests "$blog" "$bmark" functional)
+            (( ${#bfailed[@]} )) || die "baseline functional tests failed; see $blog"
+            rerun_failed "$blog" "$FUNCTIONAL_TIMEOUT" functional "${bfailed[@]}" \
+                || die "baseline functional tests failed twice (${bfailed[*]}); see $blog"
+            warn "baseline: ${bfailed[*]} failed then passed on re-run - flaky, not a kill"
+        fi
     fi
     log "baseline is green"
 fi
@@ -212,6 +290,7 @@ for patch in "${PATCHES[@]}"; do
 
     plog="$RUN_ROOT/logs/$id.log"; : >"$plog"
     started=$(date +%s)
+    KILLED_TESTS=(); FLAKY=()
     revert
 
     if ! git -C "$REPO" apply --check "$patch" 2>>"$plog"; then
@@ -233,13 +312,25 @@ for patch in "${PATCHES[@]}"; do
     fi
 
     log "$id: ctest"
+    mark=$(log_mark "$plog")
     rc=0; run_stage "$plog" "$TEST_TIMEOUT" ctest --test-dir "$REPO/$BUILD_DIR" -j "$JOBS" ${CTEST_ARGS[@]+"${CTEST_ARGS[@]}"} || rc=$?
     if (( rc != 0 )); then
-        log "$id: \033[31mdead\033[0m (ctest)"
-        record "$id" dead ctest "$rc" $(( $(date +%s) - started )) "killed by the unit test suite"
-        DEAD=$((DEAD + 1))
-        revert
-        continue
+        failed=()
+        while IFS= read -r t; do failed+=("$t"); done < <(failed_tests "$plog" "$mark" ctest)
+        rc2=1
+        if (( ${#failed[@]} )); then
+            rc2=0; rerun_failed "$plog" "$TEST_TIMEOUT" ctest "${failed[@]}" || rc2=$?
+        fi
+        if (( rc2 != 0 )); then
+            log "$id: \033[31mdead\033[0m (ctest: ${failed[*]:-unattributed})"
+            KILLED_TESTS=(${failed[@]+"${failed[@]}"})
+            record "$id" dead ctest "$rc" $(( $(date +%s) - started )) "killed by the unit test suite"
+            DEAD=$((DEAD + 1))
+            revert
+            continue
+        fi
+        warn "$id: ${failed[*]} failed then passed on re-run - flaky, not a kill"
+        FLAKY+=(ctest)
     fi
 
     if [[ "$SKIP_FUNCTIONAL" == 1 ]]; then
@@ -251,13 +342,25 @@ for patch in "${PATCHES[@]}"; do
     fi
 
     log "$id: functional tests"
+    mark=$(log_mark "$plog")
     rc=0; run_stage "$plog" "$FUNCTIONAL_TIMEOUT" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" ${FUNCTIONAL_ARGS[@]+"${FUNCTIONAL_ARGS[@]}"} || rc=$?
     if (( rc != 0 )); then
-        log "$id: \033[31mdead\033[0m (functional)"
-        record "$id" dead functional "$rc" $(( $(date +%s) - started )) "killed by the functional test suite"
-        DEAD=$((DEAD + 1))
-        revert
-        continue
+        failed=()
+        while IFS= read -r t; do failed+=("$t"); done < <(failed_tests "$plog" "$mark" functional)
+        rc2=1
+        if (( ${#failed[@]} )); then
+            rc2=0; rerun_failed "$plog" "$FUNCTIONAL_TIMEOUT" functional "${failed[@]}" || rc2=$?
+        fi
+        if (( rc2 != 0 )); then
+            log "$id: \033[31mdead\033[0m (functional: ${failed[*]:-unattributed})"
+            KILLED_TESTS=(${failed[@]+"${failed[@]}"})
+            record "$id" dead functional "$rc" $(( $(date +%s) - started )) "killed by the functional test suite"
+            DEAD=$((DEAD + 1))
+            revert
+            continue
+        fi
+        warn "$id: ${failed[*]} failed then passed on re-run - flaky, not a kill"
+        FLAKY+=(functional)
     fi
 
     log "$id: \033[32mLIVE\033[0m - the whole suite passed"
@@ -272,7 +375,7 @@ revert
 echo
 log "live: $LIVE   dead: $DEAD   not-runnable: $BROKEN   skipped: $SKIPPED"
 if command -v jq >/dev/null; then
-    jq -r '"  \(.id)  \(.status)\(if .killed_by then " (\(.killed_by))" else "" end)  \(.seconds)s"' "$OUT_FILE" >&2
+    jq -r '"  \(.id)  \(.status)\(if .killed_by then " (\(.killed_by): \(.killed_tests // ["unattributed"] | join(", ")))" else "" end)\(if .flaky then "  [flaky: \(.flaky | join(", "))]" else "" end)  \(.seconds)s"' "$OUT_FILE" >&2
 fi
 log "results: $OUT_FILE"
 log "logs:    $RUN_ROOT/logs/"
