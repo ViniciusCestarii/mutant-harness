@@ -1,7 +1,5 @@
 # mutant-harness
 
-> This project was largely vibe-coded
-
 Runs Claude Code inside a throwaway Docker container to read **one Bitcoin Core
 file**, work out what it is responsible for and who tests it, and plant a set of
 **plausible bugs** in it. You get one `git`-applicable patch per mutant plus a
@@ -184,7 +182,6 @@ results/src-script-interpreter-cpp-20260821T190000Z/
 ```
 
 `results/<file-slug>-latest` symlinks to the most recent run for that file.
-`report.json` follows `schema/mutants.schema.json`.
 
 The harness stamps `target`, `repo.commit`, `repo.head`, `bips_repo.commit`, and
 `harness.{model,requested_mutants,finished_at,duration_seconds}` after the agent
