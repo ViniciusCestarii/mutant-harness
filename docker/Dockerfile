@@ -10,7 +10,7 @@ ARG CLONE_DEPTH=1
 LABEL org.mutant-harness.kind="core-mutant-gen"
 # Bump when the image gains something a run now depends on; the harness rebuilds
 # any older image rather than failing inside the container.
-LABEL org.mutant-harness.version="2"
+LABEL org.mutant-harness.version="3"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -48,9 +48,14 @@ RUN git clone --depth "${CLONE_DEPTH}" --branch "${BIPS_REF}" "${BIPS_REPO}" /sr
 # The container runs as the invoking host uid so bind-mounted output stays owned
 # by the user. That uid is unknown at build time, so make the tree group-writable
 # and world-writable where the agent (and `git apply`) needs to write.
+#
+# /src/bitcoin/build is where the verification phase builds. It is a mount point
+# for a named volume, and Docker seeds a fresh volume with this directory's
+# permissions - so it has to be world-writable here, or the first verify run
+# cannot write to its own build dir.
 RUN chmod -R a+rwX /src/bitcoin /src/bips \
-    && mkdir -p /work /out /home/agent \
-    && chmod -R a+rwX /work /out /home/agent
+    && mkdir -p /work /out /home/agent /src/bitcoin/build \
+    && chmod -R a+rwX /work /out /home/agent /src/bitcoin/build
 
 COPY tu-check /usr/local/bin/tu-check
 # Configure the tree - configure only, no target is built. That is what writes
@@ -73,7 +78,8 @@ RUN chmod +x /usr/local/bin/tu-check; \
     fi
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY verify-entrypoint.sh /usr/local/bin/verify-entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-entrypoint.sh
 
 ENV HOME=/home/agent \
     CLAUDE_CONFIG_DIR=/home/agent/.claude \

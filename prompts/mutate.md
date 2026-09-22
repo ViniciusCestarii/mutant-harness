@@ -205,7 +205,7 @@ fields below and nothing else.
       "behaviour_change": "the observable difference: what the original does vs what the mutant does, on the input in trigger",
       "trigger": "a concrete input or scenario that reaches this line and diverges - as precisely as you can state it",
       "spec_violation": "the BIP rule, invariant, or documented behaviour this breaks, quoted, or null if none applies",
-      "severity_if_undetected": "critical | high | medium | low | info",
+      "severity_if_undetected": "critical | high | medium | low",
       "kill_prediction": {
         "likely_killed": false,
         "by": "test file and case that would catch it, or 'none found'",

@@ -77,16 +77,15 @@ The agent's claims about its own patches are not evidence, so:
   searches the tests itself. Verdicts: `sneaky` (worth running),
   `likely-killed`, `equivalent`, `invalid`. Off by default; turn it on with
   `--review`.
-- **`mutant-verify` settles it by building and testing.** The review pass is
-  still a model's opinion; only running the suites proves a mutant is alive.
-  Point [`mutant-verify`](#verifying-them-separately-mutant-verify) at your own clone and
-  the run's patches to get a real `live` / `dead` verdict per mutant, with the
-  tests that did the killing named and re-run once so a flake cannot pass for a
-  kill:
+- **Building and testing settles it.** The review pass is still a model's
+  opinion; only running the suites proves a mutant is alive.
+  [`--verify`](#verifying-them-in-the-same-command) does it in a second
+  container against the commit the patches were cut against, and gives a real
+  `live` / `dead` verdict per mutant, with the tests that did the killing named
+  and re-run once so a flake cannot pass for a kill:
 
   ```sh
-  mutant-verify --repo ~/src/bitcoin \
-      --patches results/src-script-interpreter-cpp-latest/out/patches
+  mutant-harness --file src/script/interpreter.cpp --verify
   ```
 
 ## Install
@@ -113,7 +112,7 @@ mutant-harness --file src/pubkey.cpp --model sonnet          # cheaper
 mutant-harness --file src/validation.cpp --review            # second-pass review of the mutants
 mutant-harness --file src/validation.cpp --update-core       # git fetch Core master first
 mutant-harness --file src/wallet/spend.cpp --repo ~/src/bitcoin   # your own clone
-mutant-harness --file src/pow.cpp --verify ~/src/bitcoin     # then build and test the mutants
+mutant-harness --file src/pow.cpp --verify                   # then build and test the mutants
 mutant-harness --file src/validation.cpp --detach            # background
 mutant-harness --file src/validation.cpp --timeout 45m
 mutant-harness --shell --file src/validation.cpp             # poke around the container
@@ -135,12 +134,26 @@ git -C ~/src/bitcoin checkout -- .                  # revert
 
 ### Verifying them in the same command
 
-`--verify <core-clone>` hands the run straight to `mutant-verify` when the agent
-finishes, so generation and verification are one command:
+`--verify` hands the run straight to the verifier when the agent finishes, in a
+**second container**, so generation and verdicts are one command:
 
 ```sh
-mutant-harness --file src/pow.cpp --verify ~/src/bitcoin
-mutant-harness --file src/pow.cpp --verify ~/src/bitcoin --verify-arg --skip-functional
+mutant-harness --file src/pow.cpp --verify
+mutant-harness --file src/pow.cpp --verify --verify-arg --skip-functional
+mutant-harness --file src/pow.cpp --verify-repo ~/src/bitcoin   # your own tree instead
+```
+
+Cold-building Core is the expensive half of verifying, so the build tree lives in
+a named docker volume (`mutant-harness-build`, override with
+`MUTANT_HARNESS_BUILD_VOLUME`) instead of in the container. The full build is
+paid once per volume, every mutant after that is an incremental build of one
+`.cpp` plus a relink - about ten seconds - and `--verify-only ... --verify-arg
+--resume` picks a crashed run back up against the warm tree. Expect a few GB
+per volume (4.4GB for a `RelWithDebInfo` build of `master`):
+
+```sh
+docker volume ls | grep mutant-harness      # it is there
+docker volume rm mutant-harness-build       # reclaim the space
 ```
 
 Only the mutants that apply *and* compile are queued - the rest would each burn
@@ -149,10 +162,26 @@ not filtered on: an `equivalent` call is still a model's opinion, and testing it
 is how you find out the model was wrong. Results land in the run's own
 `out/verify/`, next to the patches they came from.
 
-The clone is checked for being a clean git tree before the agent starts rather
-than after, since the run is what you would otherwise have to throw away.
-`--verify-arg` forwards anything to that `mutant-verify` invocation, and the two
-cannot be combined with `--detach` or `--shell`.
+`--verify-repo <path>` verifies in a host clone of yours instead, which is what
+you want for the one thing the container cannot do: testing the mutants against
+*your* tree, for instance to see whether a test you just wrote kills them. That
+clone is checked for being a clean git tree before the agent starts rather than
+after, since the run is what you would otherwise have to throw away.
+
+`--verify-only <run-dir>` verifies a run that already exists, with no agent and
+no `--file`: use it to verify an old run, or to pick up an interrupted one
+against the warm volume:
+
+```sh
+mutant-harness --verify-only results/src-pow-cpp-latest
+mutant-harness --verify-only results/src-pow-cpp-latest --verify-arg --resume
+```
+
+`--verify-arg` forwards anything to the `mutant-verify` invocation in every
+mode, `--docker-arg` reaches both containers, and none of them can be combined
+with `--detach` or `--shell`. Two differences from a normal build to keep in mind:
+the tree is configured with `-DENABLE_IPC=OFF` and `-DWITH_ZMQ=OFF`, so
+functional tests needing the multiprocess binary or ZMQ do not run.
 
 ### Verifying them separately: `mutant-verify`
 
