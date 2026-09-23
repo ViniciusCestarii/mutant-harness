@@ -17,7 +17,7 @@ die() { printf '[verify] error: %s\n' "$*" >&2; exit 1; }
 
 command -v mutant-verify >/dev/null \
     || die "mutant-verify is not on PATH (it is mounted in, not baked)"
-[[ -d "$BITCOIN_SRC/.git" ]] || die "no Bitcoin Core clone at $BITCOIN_SRC"
+[[ -d "$BITCOIN_SRC/.git" ]] || die "no ${TARGET_NAME:-target} clone at $BITCOIN_SRC"
 [[ -d "$PATCH_DIR" ]]        || die "no patch directory at $PATCH_DIR"
 
 export HOME="${HOME:-/home/agent}"
@@ -50,8 +50,7 @@ git -C "$BITCOIN_SRC" checkout -- . 2>/dev/null || true
 BUILD_PATH="$BITCOIN_SRC/$BUILD_DIR"
 if [[ ! -f "$BUILD_PATH/CMakeCache.txt" ]]; then
     log "configuring $BUILD_PATH (first run against this build volume)"
-    cmake -B "$BUILD_PATH" -S "$BITCOIN_SRC" \
-          -DBUILD_GUI=OFF -DWITH_ZMQ=OFF -DENABLE_IPC=OFF \
+    cmake -B "$BUILD_PATH" -S "$BITCOIN_SRC" ${CMAKE_FLAGS:-} \
         || die "cmake configure failed"
 else
     log "reusing the configured build at $BUILD_PATH"

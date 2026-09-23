@@ -4,7 +4,8 @@
 #   mutant-verify --repo ~/src/bitcoin --patches results/src-script-interpreter-cpp-latest/out/patches
 #   mutant-verify --repo ~/src/bitcoin --patches .../patches --only mut-003,mut-007
 #
-# For every patch: git apply -> cmake --build -> ctest -> functional tests.
+# For every patch: git apply -> cmake --build -> ctest -> functional tests
+# (or, with --ctime, secp256k1's ctime_tests under valgrind).
 # The first stage that fails decides the verdict; a mutant that survives all of
 # them is `live`. Everything runs on the host, in your clone, one at a time.
 # A failing suite names the tests that failed and re-runs just those once, so a
@@ -18,6 +19,7 @@ JOBS="$( (command -v nproc >/dev/null && nproc) || echo 4)"
 OUT_FILE=""
 ONLY=""
 SKIP_FUNCTIONAL=0
+CTIME=0
 FUNCTIONAL_ARGS=()
 CTEST_ARGS=()
 RESUME=0
@@ -45,6 +47,8 @@ Options:
   --jobs <n>             Parallelism for build/ctest/functional (default: nproc)
   --only <ids>           Comma-separated mutant ids to run (e.g. mut-003,mut-007)
   --skip-functional      Stop after ctest; survivors are reported as `live-unit`
+  --ctime                Replace the functional stage with secp256k1's constant-time
+                         check: valgrind --error-exitcode=42 <build>/bin/ctime_tests
   --ctest-arg <arg>      Extra arg for ctest (repeatable)
   --functional-arg <arg> Extra arg for test_runner.py (repeatable), e.g.
                          --functional-arg feature_taproot.py
@@ -56,13 +60,13 @@ Options:
   --out <file>           Results JSONL (default: <patch-dir>/../verify/results.jsonl)
   --build-timeout <d>    Kill a build after this long (e.g. 40m)
   --test-timeout <d>     Kill ctest after this long
-  --func-timeout <d>     Kill the functional run after this long
+  --func-timeout <d>     Kill the functional (or --ctime) run after this long
   -h, --help             This help
 
 Verdicts:
-  live         built, ctest passed, functional tests passed -> nothing noticed
+  live         built, ctest passed, functional tests (or --ctime) passed -> nothing noticed
   live-unit    built and ctest passed, functional run skipped
-  dead         a test failed twice (`killed_by`: ctest | functional, and
+  dead         a test failed twice (`killed_by`: ctest | functional | ctime, and
                `killed_tests`: the tests that named it)
   build-failed the mutant does not compile
   apply-failed the patch does not apply to this checkout (wrong commit?)
@@ -80,6 +84,7 @@ while [[ $# -gt 0 ]]; do
         --jobs)           JOBS="${2:?}"; shift 2 ;;
         --only)           ONLY="${2:?}"; shift 2 ;;
         --skip-functional) SKIP_FUNCTIONAL=1; shift ;;
+        --ctime)          CTIME=1; shift ;;
         --ctest-arg)      CTEST_ARGS+=("${2:?}"); shift 2 ;;
         --functional-arg) FUNCTIONAL_ARGS+=("${2:?}"); shift 2 ;;
         --baseline)       BASELINE=1; BASELINE_SET=1; shift ;;
@@ -104,6 +109,7 @@ REPO="$(cd "$REPO" && pwd)"
 # Resuming means the baseline already ran, and re-running a whole suite before
 # picking up where a Ctrl-C left off is the opposite of what --resume is for.
 if [[ "$RESUME" == 1 && "$BASELINE_SET" == 0 ]]; then BASELINE=0; fi
+[[ "$CTIME" == 0 || "$SKIP_FUNCTIONAL" == 0 ]] || die "--ctime replaces the functional stage; do not combine it with --skip-functional"
 
 # Collect the patches. A directory means "every mut-*.patch in it", sorted.
 PATCHES=()
@@ -146,7 +152,10 @@ fi
 [[ -d "$REPO/$BUILD_DIR" ]] || die "no build dir at $REPO/$BUILD_DIR (configure it first: cmake -B $BUILD_DIR)"
 
 FUNCTIONAL_RUNNER="$BUILD_DIR/test/functional/test_runner.py"
-if [[ "$SKIP_FUNCTIONAL" == 0 && ! -x "$REPO/$FUNCTIONAL_RUNNER" ]]; then
+CTIME_RUNNER="$BUILD_DIR/bin/ctime_tests"
+if [[ "$CTIME" == 1 ]]; then
+    command -v valgrind >/dev/null || die "--ctime needs valgrind on PATH"
+elif [[ "$SKIP_FUNCTIONAL" == 0 && ! -x "$REPO/$FUNCTIONAL_RUNNER" ]]; then
     warn "no $FUNCTIONAL_RUNNER in $REPO (it appears after the first build)"
 fi
 
@@ -257,7 +266,10 @@ if [[ "$BASELINE" == 1 ]]; then
         warn "baseline: ${bfailed[*]} failed then passed on re-run - flaky, not a kill"
     fi
 
-    if [[ "$SKIP_FUNCTIONAL" == 0 ]]; then
+    if [[ "$CTIME" == 1 ]]; then
+        run_stage "$blog" "$FUNCTIONAL_TIMEOUT" valgrind --error-exitcode=42 "$REPO/$CTIME_RUNNER" \
+            || die "baseline ctime_tests failed; see $blog"
+    elif [[ "$SKIP_FUNCTIONAL" == 0 ]]; then
         bmark=$(log_mark "$blog")
         if ! run_stage "$blog" "$FUNCTIONAL_TIMEOUT" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" ${FUNCTIONAL_ARGS[@]+"${FUNCTIONAL_ARGS[@]}"}; then
             bfailed=()
@@ -336,6 +348,25 @@ for patch in "${PATCHES[@]}"; do
     if [[ "$SKIP_FUNCTIONAL" == 1 ]]; then
         log "$id: \033[32mlive-unit\033[0m (functional run skipped)"
         record "$id" live-unit "" 0 $(( $(date +%s) - started )) "survived ctest; functional tests not run"
+        LIVE=$((LIVE + 1))
+        revert
+        continue
+    fi
+
+    # Deterministic under valgrind, so a failure is a kill without a re-run.
+    if [[ "$CTIME" == 1 ]]; then
+        log "$id: ctime_tests (valgrind)"
+        rc=0; run_stage "$plog" "$FUNCTIONAL_TIMEOUT" valgrind --error-exitcode=42 "$REPO/$CTIME_RUNNER" || rc=$?
+        if (( rc != 0 )); then
+            log "$id: \033[31mdead\033[0m (ctime: ctime_tests)"
+            KILLED_TESTS=(ctime_tests)
+            record "$id" dead ctime "$rc" $(( $(date +%s) - started )) "killed by the constant-time check"
+            DEAD=$((DEAD + 1))
+            revert
+            continue
+        fi
+        log "$id: \033[32mLIVE\033[0m - ctest and ctime_tests passed"
+        record "$id" live "" 0 $(( $(date +%s) - started )) "survived ctest and ctime_tests"
         LIVE=$((LIVE + 1))
         revert
         continue

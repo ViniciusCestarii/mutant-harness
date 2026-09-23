@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# mutant-harness - have an agent read one Bitcoin Core file and plant mutants in it.
+# mutant-harness - have an agent read one file of a target tree (Bitcoin Core,
+# libsecp256k1) and plant mutants in it.
 #
 #   mutant-harness --file src/script/interpreter.cpp
 #   mutant-harness --file src/net_processing.cpp --count 20 --focus "compact blocks"
+#   mutant-harness --target secp256k1 --file src/modules/schnorrsig/main_impl.h
 #
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${MUTANT_HARNESS_IMAGE:-mutant-harness-core:latest}"
+TARGET="core"
 
 TARGET_FILE=""
 COUNT=12
@@ -26,9 +28,6 @@ VERIFY_REPO=""
 VERIFY_ARGS=()
 VERIFY_ONLY_DIR=""
 EXPORT=0
-# The build tree the verification phase keeps between runs. Cold-building Core
-# is the expensive half of verifying, and it is only paid once per volume.
-VERIFY_VOLUME="${MUTANT_HARNESS_BUILD_VOLUME:-mutant-harness-build}"
 REBUILD=0
 UPDATE_CORE=0
 UPDATE_BIPS=0
@@ -44,14 +43,17 @@ die()  { printf '\033[31m[mutant-harness]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat >&2 <<'EOF'
-mutant-harness - run Claude Code in a container to plant mutants in a Core file
+mutant-harness - run Claude Code in a container to plant mutants in one file
 
 Usage:
-  mutant-harness --file <path-in-core> [options]
-  mutant-harness --apply <patch> --repo <core-clone>
+  mutant-harness [--target <name>] --file <path-in-tree> [options]
+  mutant-harness --apply <patch> --repo <clone>
 
 Options:
-  --file <path>        File to mutate, relative to the Bitcoin Core tree
+  --target <name>      Which tree to mutate, from targets/<name>.env: core
+                       (Bitcoin Core, the default) or secp256k1. Each target
+                       has its own image, prompts and verify build volume.
+  --file <path>        File to mutate, relative to the target tree
                        (e.g. src/script/interpreter.cpp). Required.
   --count <n>          How many mutants to aim for (default: 12)
   --focus <text>       Steer the agent at one area ("segwit v1 witness parsing",
@@ -60,14 +62,15 @@ Options:
   --ops <list>         Comma-separated operator classes to prefer, from:
                        deletion, relocation, reorder, boundary, condition,
                        constant, scope, state, error-handling, numeric,
-                       early-exit, concurrency, serialization
+                       early-exit, concurrency (core), constant-time
+                       (secp256k1), serialization
   --out <dir>          Output root (default: ./results); results land in
                        <dir>/<file-slug>-<timestamp>/
   --model <name>       Model for the mutator (default: opus)
   --review             Run the second-pass review of the mutants (default: off)
   --review-model <n>   Model for the review pass (default: same as --model)
   --fallback-model <n> Fallback when the primary is overloaded
-  --repo <path>        Mount a host Bitcoin Core clone instead of the baked-in one
+  --repo <path>        Mount a host clone of the target instead of the baked-in one
   --bips-repo <path>   Mount a host bitcoin/bips clone instead of the baked-in one
   --verify             When the run finishes, build and test every mutant that
                        applies and compiles, in a second container. Needs no
@@ -103,6 +106,7 @@ EOF
 BUILD_ONLY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --target)         TARGET="${2:?}"; shift 2 ;;
         --file)           TARGET_FILE="${2:?}"; shift 2 ;;
         --count)          COUNT="${2:?}"; shift 2 ;;
         --focus)          FOCUS="${2:?}"; shift 2 ;;
@@ -133,6 +137,39 @@ while [[ $# -gt 0 ]]; do
         *)                die "unknown option: $1 (try --help)" ;;
     esac
 done
+
+# --------------------------------------------------------------- target ----
+# Everything that differs between targets - repo, image, cmake flags, header
+# check units, default verify args - lives in one profile.
+PROFILE="$HERE/targets/$TARGET.env"
+[[ "$TARGET" =~ ^[a-z0-9_-]+$ && -r "$PROFILE" ]] \
+    || die "unknown --target $TARGET (have: $(cd "$HERE/targets" && ls *.env | sed 's/\.env$//' | tr '\n' ' '))"
+# shellcheck source=/dev/null
+source "$PROFILE"
+IMAGE="${MUTANT_HARNESS_IMAGE:-$IMAGE}"
+# The build tree the verification phase keeps between runs. Cold-building the
+# target is the expensive half of verifying, and it is only paid once per volume.
+if [[ "$TARGET_NAME" == core ]]; then
+    VERIFY_VOLUME="${MUTANT_HARNESS_BUILD_VOLUME:-mutant-harness-build}"
+else
+    VERIFY_VOLUME="${MUTANT_HARNESS_BUILD_VOLUME:-mutant-harness-build-$TARGET_NAME}"
+fi
+# The profile's verify args go first so a --verify-arg can still add to them.
+if [[ -n "$VERIFY_DEFAULT_ARGS" ]]; then
+    read -r -a _defaults <<< "$VERIFY_DEFAULT_ARGS"
+    VERIFY_ARGS=("${_defaults[@]}" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"})
+fi
+# A run can only be verified in the image of the target it was cut from; say so
+# before building or starting the wrong one.
+if [[ -n "$VERIFY_ONLY_DIR" ]] && command -v jq >/dev/null; then
+    for m in "$VERIFY_ONLY_DIR/out/mutants.json" "$VERIFY_ONLY_DIR/mutants.json"; do
+        [[ -f "$m" ]] || continue
+        made_for="$(jq -r '.harness.target // "core"' "$m" 2>/dev/null || true)"
+        [[ -z "$made_for" || "$made_for" == "$TARGET_NAME" ]] \
+            || die "$VERIFY_ONLY_DIR was generated with --target $made_for; pass --target $made_for"
+        break
+    done
+fi
 
 # ----------------------------------------------------------------- apply ----
 # Applying a produced mutant to a real clone is a local git operation; it needs
@@ -249,12 +286,18 @@ command -v docker >/dev/null || die "docker not found on PATH"
 
 # ---------------------------------------------------------------- image ----
 build_image() {
-    log "building $IMAGE (first build clones Bitcoin Core and the BIPs, a few minutes)"
-    docker build -t "$IMAGE" "$HERE/docker"
+    log "building $IMAGE (first build clones $TARGET_NAME and the BIPs, a few minutes)"
+    docker build -t "$IMAGE" \
+        --build-arg "TARGET_NAME=$TARGET_NAME" \
+        --build-arg "REPO_URL=$REPO_URL" \
+        --build-arg "CMAKE_FLAGS=$CMAKE_FLAGS" \
+        --build-arg "APT_PACKAGES=$APT_PACKAGES" \
+        --build-arg "TU_HEADER_UNITS=$TU_HEADER_UNITS" \
+        "$HERE/docker"
 }
 
 # What this harness needs the image to contain. Bumped in the Dockerfile too.
-IMAGE_VERSION=3
+IMAGE_VERSION=4
 
 image_label() {
     docker image inspect "$IMAGE" --format "{{index .Config.Labels \"$1\"}}" 2>/dev/null
@@ -262,7 +305,8 @@ image_label() {
 
 # An image with our tag but without our label belongs to something else; rebuild
 # rather than silently running a stranger's entrypoint.
-image_is_ours()    { [[ "$(image_label org.mutant-harness.kind)" == "core-mutant-gen" ]]; }
+image_is_ours()    { [[ "$(image_label org.mutant-harness.kind)" == "core-mutant-gen" \
+                         && "$(image_label org.mutant-harness.target)" == "$TARGET_NAME" ]]; }
 image_is_current() { [[ "$(image_label org.mutant-harness.version)" == "$IMAGE_VERSION" ]]; }
 
 if [[ "$REBUILD" == 1 ]] || ! image_is_ours || ! image_is_current; then
@@ -315,8 +359,8 @@ WORK_DIR="$RUN_DIR/work"
 OUT_DIR="$RUN_DIR/out"
 mkdir -p "$WORK_DIR" "$OUT_DIR/patches"
 
-cp "$HERE/prompts/mutate.md" "$WORK_DIR/prompt.md"
-cp "$HERE/prompts/review.md" "$WORK_DIR/review.md"
+cp "$HERE/prompts/$TARGET_NAME/mutate.md" "$WORK_DIR/prompt.md"
+cp "$HERE/prompts/$TARGET_NAME/review.md" "$WORK_DIR/review.md"
 
 # ------------------------------------------------------------------ auth ----
 AUTH_ARGS=()
@@ -364,7 +408,7 @@ DOCKER_ARGS=(
 [[ -n "$REPO_MOUNT" ]] && {
     [[ -d "$REPO_MOUNT/.git" ]] || die "--repo $REPO_MOUNT is not a git clone"
     DOCKER_ARGS+=(-v "$(cd "$REPO_MOUNT" && pwd):/src/bitcoin")
-    warn "using host Core clone: $REPO_MOUNT (the agent edits and reverts files in it)"
+    warn "using host $TARGET_NAME clone: $REPO_MOUNT (the agent edits and reverts files in it)"
 }
 [[ -n "$BIPS_REPO_MOUNT" ]] && {
     [[ -d "$BIPS_REPO_MOUNT/.git" ]] || die "--bips-repo $BIPS_REPO_MOUNT is not a git clone"
@@ -416,7 +460,7 @@ if [[ -s "$MANIFEST" ]] && command -v jq >/dev/null && jq empty "$MANIFEST" 2>/d
     echo
     jq -r '
       "target: \(.target.file // "?")  (\(.target.lines // "whole file"))",
-      "core:   \(.repo.commit[0:12] // "?")",
+      "\(.harness.target // "core"): \(.repo.commit[0:12] // "?")",
       "\((.mutants // []) | length) mutants, " +
         "\([.mutants[]? | select(.apply_ok == false)] | length) that do not apply",
       (if .review then

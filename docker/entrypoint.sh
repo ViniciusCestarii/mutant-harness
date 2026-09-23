@@ -28,12 +28,14 @@ LINE_RANGE="${LINE_RANGE:-}"
 OPS="${OPS:-}"
 UPDATE_CORE="${UPDATE_CORE:-0}"
 UPDATE_BIPS="${UPDATE_BIPS:-0}"
+TARGET_NAME="${TARGET_NAME:-core}"
+CMAKE_FLAGS="${CMAKE_FLAGS:-}"
 
 log() { printf '[harness] %s\n' "$*" >&2; }
 die() { printf '[harness] error: %s\n' "$*" >&2; exit 1; }
 
 [[ -r "$PROMPT_TEMPLATE" ]] || die "prompt not readable at $PROMPT_TEMPLATE"
-[[ -d "$BITCOIN_SRC/.git" ]] || die "no Bitcoin Core clone at $BITCOIN_SRC"
+[[ -d "$BITCOIN_SRC/.git" ]] || die "no $TARGET_NAME clone at $BITCOIN_SRC"
 [[ -d "$BIPS_SRC/.git" ]] || die "no bitcoin/bips clone at $BIPS_SRC"
 
 mkdir -p "$OUT_DIR" "$PATCH_DIR" /work
@@ -45,7 +47,7 @@ git config --global user.email "harness@localhost" 2>/dev/null || true
 git config --global user.name "mutant-harness" 2>/dev/null || true
 
 if [[ "$UPDATE_CORE" == "1" ]]; then
-    log "refreshing Bitcoin Core master..."
+    log "refreshing $TARGET_NAME master..."
     git -C "$BITCOIN_SRC" fetch --depth 1 origin master \
         && git -C "$BITCOIN_SRC" reset --hard FETCH_HEAD \
         || log "warning: refresh failed, using the baked-in clone"
@@ -62,13 +64,13 @@ CORE_COMMIT="$(git -C "$BITCOIN_SRC" rev-parse HEAD)"
 CORE_DESC="$(git -C "$BITCOIN_SRC" log -1 --format='%cI %s')"
 BIPS_COMMIT="$(git -C "$BIPS_SRC" rev-parse HEAD)"
 BIPS_DESC="$(git -C "$BIPS_SRC" log -1 --format='%cI %s')"
-log "bitcoin core @ $CORE_COMMIT"
+log "$TARGET_NAME @ $CORE_COMMIT"
 log "            $CORE_DESC"
 log "bitcoin bips @ $BIPS_COMMIT"
 
 # --------------------------------------------------------------- target ----
 TARGET_PATH="$BITCOIN_SRC/$TARGET_FILE"
-[[ -f "$TARGET_PATH" ]] || die "no such file in the Core tree: $TARGET_FILE"
+[[ -f "$TARGET_PATH" ]] || die "no such file in the $TARGET_NAME tree: $TARGET_FILE"
 TARGET_LINES="$(wc -l < "$TARGET_PATH")"
 log "target: $TARGET_FILE ($TARGET_LINES lines)"
 
@@ -120,8 +122,7 @@ setup_compile_check() {
         log "build dir does not describe $CORE_COMMIT; reconfiguring (a few seconds) ..."
         BITCOIN_BUILD=/tmp/mutant-build
         if ! cmake -B "$BITCOIN_BUILD" -S "$BITCOIN_SRC" \
-                   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-                   -DBUILD_GUI=OFF -DWITH_ZMQ=OFF -DENABLE_IPC=OFF \
+                   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON $CMAKE_FLAGS \
                    >/tmp/cmake-configure.log 2>&1; then
             log "warning: cmake configure failed (see /tmp/cmake-configure.log); compile check off"
             return 0
@@ -129,7 +130,16 @@ setup_compile_check() {
     fi
 
     export BITCOIN_BUILD
-    if ! tu-check "$TARGET_FILE" >/tmp/tu-baseline.log 2>&1; then
+    local rc=0
+    tu-check "$TARGET_FILE" >/tmp/tu-baseline.log 2>&1 || rc=$?
+    # 3: a header this configuration never compiles (e.g. secp256k1's
+    # field_10x26 on a 64-bit build). No build or test here would ever run a
+    # mutant of it, so every one would come back a fake survivor.
+    if [[ "$rc" == 3 ]]; then
+        cat /tmp/tu-baseline.log >&2
+        die "$TARGET_FILE is not compiled in this configuration; its mutants could never be killed"
+    fi
+    if [[ "$rc" != 0 ]]; then
         log "warning: cannot compile-check $TARGET_FILE unpatched (a header, an"
         log "         excluded target, or it does not build clean); compile check off"
         log "         see /tmp/tu-baseline.log - every mutant would look broken"
@@ -142,14 +152,14 @@ setup_compile_check() {
 setup_compile_check
 
 if [[ "$COMPILE_CHECK" == "1" ]]; then
-    COMPILE_TEXT="Do not build the node: a Core build would consume your entire budget. You
+    COMPILE_TEXT="Do not build the tree: a full build would consume your budget. You
 do not have to guess either. \`tu-check $TARGET_FILE\` compiles that one
 translation unit and nothing else, in seconds, and prints the compiler's own
 errors. Run it after every edit, before you take the diff, and fix or drop
 anything it rejects. The harness re-runs it on each patch after you exit, so a
 mutant that does not compile is recorded as such whatever you claim about it."
 else
-    COMPILE_TEXT="Do not build the node. A Core build would consume your entire budget, and no
+    COMPILE_TEXT="Do not build the tree. A full build would consume your budget, and no
 compile check is available in this run, so you must reason about compilability
 rather than check it - which is a hard constraint on what you may write: only
 mutants you are confident compile."
@@ -480,6 +490,7 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
        --arg bipscommit "$BIPS_COMMIT" \
        --arg bipsdesc "$BIPS_DESC" \
        --arg model "$MODEL" \
+       --arg target "$TARGET_NAME" \
        --argjson requested "$MUTANT_COUNT" \
        --argjson compilecheck "$COMPILE_CHECK" \
        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -489,7 +500,7 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
                                          focus: (if $focus == "" then null else $focus end)}),
              repo: ((.repo // {}) + {commit: $commit, head: $desc}),
              bips_repo: {commit: $bipscommit, head: $bipsdesc},
-             harness: {model: $model, requested_mutants: $requested,
+             harness: {target: $target, model: $model, requested_mutants: $requested,
                        compile_checked: ($compilecheck == 1),
                        finished_at: $ts, duration_seconds: $elapsed}}' \
        "$REPORT_FILE" > "$TMP" && mv "$TMP" "$REPORT_FILE"
