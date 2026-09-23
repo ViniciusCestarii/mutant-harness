@@ -25,6 +25,7 @@ VERIFY_CONTAINER=0
 VERIFY_REPO=""
 VERIFY_ARGS=()
 VERIFY_ONLY_DIR=""
+EXPORT=0
 # The build tree the verification phase keeps between runs. Cold-building Core
 # is the expensive half of verifying, and it is only paid once per volume.
 VERIFY_VOLUME="${MUTANT_HARNESS_BUILD_VOLUME:-mutant-harness-build}"
@@ -81,6 +82,8 @@ Options:
   --verify-only <dir>  Verify an existing run directory and exit: no agent, no
                        generation. Use it to resume an interrupted verification
                        (with --verify-arg --resume) or to verify an old run.
+  --export             After verification, write the live mutants to
+                       out/import.json with bin/mutant-export
   --update-core        git fetch master inside the container first
   --update-bips        git fetch the bips repo too
   --rebuild            Rebuild the docker image first
@@ -116,6 +119,7 @@ while [[ $# -gt 0 ]]; do
         --verify-repo)    VERIFY_REPO="${2:?}"; shift 2 ;;
         --verify-arg)     VERIFY_ARGS+=("${2:?}"); shift 2 ;;
         --verify-only)    VERIFY_ONLY_DIR="${2:?}"; shift 2 ;;
+        --export)         EXPORT=1; shift ;;
         --update-core)    UPDATE_CORE=1; shift ;;
         --update-bips)    UPDATE_BIPS=1; shift ;;
         --rebuild)        REBUILD=1; shift ;;
@@ -160,6 +164,7 @@ if [[ "$VERIFY_CONTAINER" == 1 || -n "$VERIFY_REPO" || -n "$VERIFY_ONLY_DIR" ]];
     [[ "$DETACH" == 0 && "$SHELL_MODE" == 0 ]] \
         || die "verification cannot be combined with --detach or --shell (it runs once the container exits)"
 fi
+[[ "$EXPORT" == 0 || "$VERIFY" == 1 ]] || die "--export needs --verify, --verify-repo or --verify-only"
 if [[ -n "$VERIFY_REPO" ]]; then
     [[ -d "$VERIFY_REPO/.git" ]] || die "--verify-repo $VERIFY_REPO is not a git clone"
     [[ -z "$(git -C "$VERIFY_REPO" status --porcelain --untracked-files=no)" ]] \
@@ -171,9 +176,9 @@ fi
 # compile: the others would each burn a build to prove what the manifest already
 # says. Verdicts from --review are *not* filtered on - an `equivalent` call is
 # still a model's opinion, and testing it is how you find out the model was
-# wrong. Either mode replaces this process, so its exit code is ours.
+# wrong. Either mode's exit code is ours; --export runs only when it succeeded.
 run_verification() {  # run_verification <out-dir> <container-name>
-    local out_dir="$1" name="$2"
+    local out_dir="$1" name="$2" rc=0
     local manifest="$out_dir/mutants.json"
 
     [[ -s "$manifest" ]] || die "no mutants.json in $out_dir"
@@ -192,8 +197,9 @@ run_verification() {  # run_verification <out-dir> <container-name>
 
     if [[ -n "$VERIFY_REPO" ]]; then
         log "verifying ${runnable//,/ } in $VERIFY_REPO"
-        exec "$VERIFIER" --repo "$VERIFY_REPO" --patches "$out_dir/patches" \
-             --only "$runnable" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"}
+        "$VERIFIER" --repo "$VERIFY_REPO" --patches "$out_dir/patches" \
+            --only "$runnable" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"} || rc=$?
+        export_live "$out_dir" "$rc" "$VERIFY_REPO"
     fi
 
     # A second container, not the generating one: this phase wants CPU for hours
@@ -219,7 +225,24 @@ run_verification() {  # run_verification <out-dir> <container-name>
     )
     [[ -n "$REPO_MOUNT" ]] && args+=(-v "$(cd "$REPO_MOUNT" && pwd):/src/bitcoin")
     [[ ${#EXTRA_DOCKER_ARGS[@]} -gt 0 ]] && args+=("${EXTRA_DOCKER_ARGS[@]}")
-    exec docker "${args[@]}" "$IMAGE" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"}
+    docker "${args[@]}" "$IMAGE" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"} || rc=$?
+    export_live "$out_dir" "$rc" "$REPO_MOUNT"
+}
+
+# Finish a verification: write out/import.json when --export asked for it, then
+# exit with the verifier's code. A failed export only warns, it does not turn a
+# good verification into a failed one.
+export_live() {  # export_live <out-dir> <verify-rc> <core-clone-or-empty>
+    local out_dir="$1" rc="$2" repo="$3"
+    if [[ "$EXPORT" == 1 && "$rc" == 0 ]]; then
+        if "$HERE/bin/mutant-export" "$out_dir" -o "$out_dir/import.json" \
+               ${repo:+--repo "$repo"}; then
+            log "import file:      $out_dir/import.json"
+        else
+            warn "export failed; retry with: mutant-export $out_dir -o $out_dir/import.json"
+        fi
+    fi
+    exit "$rc"
 }
 
 command -v docker >/dev/null || die "docker not found on PATH"

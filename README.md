@@ -113,6 +113,7 @@ mutant-harness --file src/validation.cpp --review            # second-pass revie
 mutant-harness --file src/validation.cpp --update-core       # git fetch Core master first
 mutant-harness --file src/wallet/spend.cpp --repo ~/src/bitcoin   # your own clone
 mutant-harness --file src/pow.cpp --verify                   # then build and test the mutants
+mutant-harness --file src/pow.cpp --verify --export          # and write the live ones to out/import.json
 mutant-harness --file src/validation.cpp --detach            # background
 mutant-harness --file src/validation.cpp --timeout 45m
 mutant-harness --shell --file src/validation.cpp             # poke around the container

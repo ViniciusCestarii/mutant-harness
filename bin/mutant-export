@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""mutant-export - turn a verified run's `live` mutants into the mutant catalogue import JSON for https://mutanthub.space/.
+
+  mutant-export results/src-policy-policy-cpp-latest > import.json
+  mutant-export results/src-pow-cpp-latest --repo ~/src/bitcoin -o import.json
+
+Reads out/mutants.json and out/verify/results.jsonl, keeps the mutants whose
+status is `live`, and writes { "tool", "defaults", "mutants" }. originalCode and
+mutatedCode are the smallest contiguous span covering every hunk of the patch,
+so the file at the run's commit is needed: taken from --repo with `git show`,
+otherwise fetched from GitHub.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+HARNESS = Path(__file__).resolve().parent.parent
+GITHUB_RAW = "https://raw.githubusercontent.com/bitcoin/bitcoin/{commit}/{file}"
+# Harness operator classes that have an equivalent in the catalogue's
+# MutationOperator enum; everything else is UNKNOWN.
+OPERATORS = {
+    "deletion": "STATEMENT_DELETION",
+    "boundary": "RELATIONAL_OPERATOR",
+    "condition": "CONDITIONAL_OPERATOR",
+    "constant": "CONSTANT_REPLACEMENT",
+    "numeric": "ARITHMETIC_OPERATOR",
+    "early-exit": "RETURN_VALUE",
+}
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+
+
+def die(msg):
+    sys.exit(f"mutant-export: {msg}")
+
+
+def read_file_at(commit, path, repo):
+    if repo:
+        r = subprocess.run(["git", "-C", repo, "show", f"{commit}:{path}"],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return r.stdout
+        print(f"mutant-export: {r.stderr.strip()}; fetching {path} from GitHub instead",
+              file=sys.stderr)
+    with urllib.request.urlopen(GITHUB_RAW.format(commit=commit, file=path)) as r:
+        return r.read().decode()
+
+
+def apply_patch(old, patch):
+    """Apply a single-file unified diff to `old` (a list of lines)."""
+    new, pos, lines = [], 0, patch.splitlines()
+    i = 0
+    while i < len(lines):
+        m = HUNK.match(lines[i])
+        i += 1
+        if not m:
+            continue
+        start = int(m.group(1)) - (0 if m.group(2) == "0" else 1)
+        new += old[pos:start]
+        pos = start
+        while i < len(lines) and not lines[i].startswith("@@"):
+            line = lines[i]
+            i += 1
+            if line.startswith("\\"):
+                continue
+            tag, text = line[:1], line[1:]
+            if tag in (" ", ""):
+                if old[pos] != text:
+                    raise ValueError(f"context mismatch at line {pos + 1}")
+                new.append(text)
+                pos += 1
+            elif tag == "-":
+                if old[pos] != text:
+                    raise ValueError(f"removed line mismatch at line {pos + 1}")
+                pos += 1
+            elif tag == "+":
+                new.append(text)
+    return new + old[pos:]
+
+
+def changed_span(old, new):
+    """(start index, original lines, mutated lines) of the one region that differs."""
+    p = 0
+    while p < min(len(old), len(new)) and old[p] == new[p]:
+        p += 1
+    s = 0
+    while s < min(len(old), len(new)) - p and old[-1 - s] == new[-1 - s]:
+        s += 1
+    orig, mut = old[p:len(old) - s], new[p:len(new) - s]
+    if not orig:  # pure insertion: anchor it on the line above (or below at the top)
+        if p > 0:
+            p -= 1
+            orig, mut = [old[p]], [old[p]] + mut
+        else:
+            orig, mut = [old[0]], mut + [old[0]]
+    return p, orig, mut
+
+
+def description(m):
+    kp = m.get("kill_prediction") or {}
+    parts = [
+        ("Intent", m.get("intent")),
+        ("Behaviour change", m.get("behaviour_change")),
+        ("Trigger", m.get("trigger")),
+        ("Spec violation", m.get("spec_violation")),
+        ("Severity if undetected", m.get("severity_if_undetected")),
+        ("Why tests miss it", kp.get("where_you_looked")),
+        ("Plausibility", m.get("plausibility")),
+        ("Equivalence risk", m.get("equivalence_risk")),
+    ]
+    body = "\n\n".join(f"**{k}:** {v}" for k, v in parts if v)
+    return f"> This description is AI generated, mistakes can be made.\n\n{body}"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Export a run's live mutants as catalogue import JSON.")
+    ap.add_argument("run", help="run directory, e.g. results/src-pow-cpp-latest")
+    ap.add_argument("--repo", help="Core clone to read the target file from (default: GitHub)")
+    ap.add_argument("-o", "--output", help="output file (default: stdout)")
+    args = ap.parse_args()
+
+    run = Path(args.run).resolve()
+    if (run / "mutants.json").is_file():  # given out/ itself
+        run = run.parent
+    out = run / "out"
+    manifest_path = out / "mutants.json"
+    results_path = out / "verify" / "results.jsonl"
+    if not manifest_path.is_file():
+        die(f"no {manifest_path}")
+    if not results_path.is_file():
+        die(f"no {results_path}: verify the run first")
+
+    manifest = json.loads(manifest_path.read_text())
+    commit = manifest["repo"]["commit"]
+    target = manifest["target"]["file"]
+
+    # A resumed verify can record a mutant twice; the last verdict wins.
+    status = {}
+    for line in results_path.read_text().splitlines():
+        if line.strip():
+            r = json.loads(line)
+            status[r["id"]] = r["status"]
+
+    old = read_file_at(commit, target, args.repo).splitlines()
+
+    rows = []
+    for m in manifest["mutants"]:
+        if status.get(m["id"]) != "live":
+            continue
+        patch = (out / m["patch"]).read_text()
+        try:
+            start, orig, mut = changed_span(old, apply_patch(old, patch))
+        except (ValueError, IndexError) as e:
+            print(f"mutant-export: skipping {m['id']}: patch does not apply at {commit}: {e}",
+                  file=sys.stderr)
+            continue
+        rows.append({
+            "file": target,
+            "startLine": start + 1,
+            "endLine": start + len(orig),
+            "originalCode": "\n".join(orig),
+            "mutatedCode": "\n".join(mut),
+            "diff": patch,
+            "mutationOperator": OPERATORS.get(m["operator"], "UNKNOWN"),
+            "title": m["title"],
+            "description": description(m),
+            "notes": f"mutant-harness operator: {m['operator']}; "
+                     f"location: {m['location']['function']} lines {m['location']['lines']}",
+            "tool": {"mutantId": f"{run.name}/{m['id']}"},
+        })
+
+    harness_rev = subprocess.run(["git", "-C", str(HARNESS), "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True).stdout.strip()
+    doc = {
+        "tool": {"name": "mutant-harness", "version": harness_rev or "unknown"},
+        "defaults": {
+            "commit": commit,
+            "buildCommand": "cmake -B build -DBUILD_GUI=OFF -DWITH_ZMQ=OFF -DENABLE_IPC=OFF"
+                            " && cmake --build build -j$(nproc)",
+            "testCommand": "ctest --test-dir build -j$(nproc)"
+                           " && build/test/functional/test_runner.py -j$(nproc)",
+            "environment": "Debian bookworm, GCC (build-essential), cmake",
+            "observedResult": "SURVIVED",
+        },
+        "mutants": rows,
+    }
+    text = json.dumps(doc, indent=2) + "\n"
+    if args.output:
+        Path(args.output).write_text(text)
+    else:
+        sys.stdout.write(text)
+    print(f"mutant-export: {len(rows)} live mutants exported", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
