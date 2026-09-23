@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Syntax-check one Bitcoin Core translation unit.
+"""Syntax-check one translation unit of the target tree.
 
     tu-check src/script/interpreter.cpp
+    tu-check src/group_impl.h          (with TU_HEADER_UNITS set)
 
 Exit codes:
   0  it compiles
   1  it does not; the compiler's own output is on stdout
   2  no check is available here - no configured build dir, or the file is not a
      translation unit (a header, or a target this build excludes)
+  3  the file is a header that none of TU_HEADER_UNITS includes in this
+     configuration, so nothing built here would ever compile or test it
 
 BITCOIN_SRC and BITCOIN_BUILD locate the tree and the configured build dir.
+TU_HEADER_UNITS (space-separated, relative to the tree) names the units a
+header is checked through: every one of them that includes it must compile.
 """
 import json
 import os
@@ -64,6 +69,47 @@ def syntax_only(args):
     return out
 
 
+def run(entry, build, args):
+    return subprocess.run(args, cwd=entry.get("directory", build),
+                          capture_output=True, text=True)
+
+
+def entry_args(entry):
+    return entry.get("arguments") or shlex.split(entry["command"])
+
+
+def includes(entry, build, want):
+    """Whether this unit pulls in `want`, per the preprocessor's own -M list."""
+    args = syntax_only(entry_args(entry))[:-1] + ["-M"]
+    proc = run(entry, build, args)
+    if proc.returncode != 0:
+        return False
+    cwd = entry.get("directory", build)
+    deps = proc.stdout.replace("\\\n", " ").split()
+    return any(os.path.realpath(os.path.join(cwd, d)) == want
+               for d in deps if not d.endswith(":"))
+
+
+def check_header(db_path, src, build, target, want, units):
+    entries = []
+    for u in units:
+        e = load_entry(db_path, build, os.path.realpath(os.path.join(src, u)))
+        if e is not None and includes(e, build, want):
+            entries.append(e)
+    if not entries:
+        print(f"tu-check: {target} is included by none of {' '.join(units)} "
+              f"in this configuration", file=sys.stderr)
+        return 3
+    failed = False
+    for e in entries:
+        proc = run(e, build, syntax_only(entry_args(e)))
+        output = (proc.stdout + proc.stderr).strip()
+        if output:
+            print(output)
+        failed |= proc.returncode != 0
+    return 1 if failed else 0
+
+
 def main(argv):
     if len(argv) != 2:
         print("usage: tu-check <file-in-core-tree>", file=sys.stderr)
@@ -81,15 +127,15 @@ def main(argv):
                             else os.path.join(src, target))
 
     entry = load_entry(db_path, build, want)
+    units = os.environ.get("TU_HEADER_UNITS", "").split()
+    if entry is None and units:
+        return check_header(db_path, src, build, target, want, units)
     if entry is None:
         print(f"tu-check: {target} is not a translation unit in this build "
               f"(no entry in {db_path})", file=sys.stderr)
         return 2
 
-    args = entry.get("arguments") or shlex.split(entry["command"])
-    proc = subprocess.run(syntax_only(args),
-                          cwd=entry.get("directory", build),
-                          capture_output=True, text=True)
+    proc = run(entry, build, syntax_only(entry_args(entry)))
     output = (proc.stdout + proc.stderr).strip()
     if output:
         print(output)

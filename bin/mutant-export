@@ -8,18 +8,20 @@ Reads out/mutants.json and out/verify/results.jsonl, keeps the mutants whose
 status is `live`, and writes { "tool", "defaults", "mutants" }. originalCode and
 mutatedCode are the smallest contiguous span covering every hunk of the patch,
 so the file at the run's commit is needed: taken from --repo with `git show`,
-otherwise fetched from GitHub.
+otherwise fetched from GitHub. The repo, build and test commands come from
+targets/<harness.target>.env (core for runs made before targets existed).
 """
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 
 HARNESS = Path(__file__).resolve().parent.parent
-GITHUB_RAW = "https://raw.githubusercontent.com/bitcoin/bitcoin/{commit}/{file}"
+GITHUB_RAW = "https://raw.githubusercontent.com/{repo}/{commit}/{file}"
 # Harness operator classes that have an equivalent in the catalogue's
 # MutationOperator enum; everything else is UNKNOWN.
 OPERATORS = {
@@ -37,7 +39,21 @@ def die(msg):
     sys.exit(f"mutant-export: {msg}")
 
 
-def read_file_at(commit, path, repo):
+def load_profile(name):
+    """targets/<name>.env as a dict: KEY=value lines, shell-quoted."""
+    path = HARNESS / "targets" / f"{name}.env"
+    if not path.is_file():
+        die(f"no target profile {path}")
+    profile = {}
+    for line in path.read_text().splitlines():
+        words = shlex.split(line, comments=True)
+        if words and "=" in words[0]:
+            key, _, value = words[0].partition("=")
+            profile[key] = value
+    return profile
+
+
+def read_file_at(commit, path, repo, github_repo):
     if repo:
         r = subprocess.run(["git", "-C", repo, "show", f"{commit}:{path}"],
                            capture_output=True, text=True)
@@ -45,7 +61,7 @@ def read_file_at(commit, path, repo):
             return r.stdout
         print(f"mutant-export: {r.stderr.strip()}; fetching {path} from GitHub instead",
               file=sys.stderr)
-    with urllib.request.urlopen(GITHUB_RAW.format(commit=commit, file=path)) as r:
+    with urllib.request.urlopen(GITHUB_RAW.format(repo=github_repo, commit=commit, file=path)) as r:
         return r.read().decode()
 
 
@@ -118,7 +134,7 @@ def description(m):
 def main():
     ap = argparse.ArgumentParser(description="Export a run's live mutants as catalogue import JSON.")
     ap.add_argument("run", help="run directory, e.g. results/src-pow-cpp-latest")
-    ap.add_argument("--repo", help="Core clone to read the target file from (default: GitHub)")
+    ap.add_argument("--repo", help="clone to read the target file from (default: GitHub)")
     ap.add_argument("-o", "--output", help="output file (default: stdout)")
     args = ap.parse_args()
 
@@ -136,6 +152,7 @@ def main():
     manifest = json.loads(manifest_path.read_text())
     commit = manifest["repo"]["commit"]
     target = manifest["target"]["file"]
+    profile = load_profile((manifest.get("harness") or {}).get("target") or "core")
 
     # A resumed verify can record a mutant twice; the last verdict wins.
     status = {}
@@ -144,7 +161,7 @@ def main():
             r = json.loads(line)
             status[r["id"]] = r["status"]
 
-    old = read_file_at(commit, target, args.repo).splitlines()
+    old = read_file_at(commit, target, args.repo, profile["GITHUB_REPO"]).splitlines()
 
     rows = []
     for m in manifest["mutants"]:
@@ -178,11 +195,10 @@ def main():
         "tool": {"name": "mutant-harness", "version": harness_rev or "unknown"},
         "defaults": {
             "commit": commit,
-            "buildCommand": "cmake -B build -DBUILD_GUI=OFF -DWITH_ZMQ=OFF -DENABLE_IPC=OFF"
+            "buildCommand": f"cmake -B build {profile['CMAKE_FLAGS']}"
                             " && cmake --build build -j$(nproc)",
-            "testCommand": "ctest --test-dir build -j$(nproc)"
-                           " && build/test/functional/test_runner.py -j$(nproc)",
-            "environment": "Debian bookworm, GCC (build-essential), cmake",
+            "testCommand": profile["TEST_COMMAND"],
+            "environment": profile["ENVIRONMENT"],
             "observedResult": "SURVIVED",
         },
         "mutants": rows,

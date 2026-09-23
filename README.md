@@ -9,9 +9,10 @@ notice.
 ```
 mutant-harness --file src/script/interpreter.cpp
 mutant-harness --file src/net_processing.cpp --count 20 --focus "compact blocks"
+mutant-harness --target secp256k1 --file src/modules/schnorrsig/main_impl.h
 ```
 
-That starts a container holding a clone of Bitcoin Core *and* a full clone of
+It also runs on [libsecp256k1](#targets). That starts a container holding a clone of Bitcoin Core *and* a full clone of
 `bitcoin/bips`, points the agent at the file you named, gives it full
 permissions inside the container, and writes
 `results/src-script-interpreter-cpp-<timestamp>/out/mutants.json` alongside
@@ -117,6 +118,7 @@ mutant-harness --file src/pow.cpp --verify --export          # and write the liv
 mutant-harness --file src/validation.cpp --detach            # background
 mutant-harness --file src/validation.cpp --timeout 45m
 mutant-harness --shell --file src/validation.cpp             # poke around the container
+mutant-harness --target secp256k1 --file src/group_impl.h --verify   # libsecp256k1
 ```
 
 Full flag list: `mutant-harness --help`.
@@ -245,6 +247,44 @@ it does not run `cmake -B`. It proves the unpatched tree is green before it
 starts, because a red baseline scores every mutant as `dead`; that costs one
 suite run against the N you are about to do anyway. `--no-baseline` skips it,
 and `--resume` skips it by default. Full flag list: `mutant-verify --help`.
+
+## Targets
+
+`--target <name>` picks the tree to mutate. `core` (Bitcoin Core) is the
+default; `secp256k1` is `bitcoin-core/secp256k1`. Everything that differs
+between them lives in `targets/<name>.env` - repo URL, image tag, cmake flags,
+extra apt packages, how headers are compile-checked, default verify args, and
+the build/test commands `mutant-export` records - plus a prompt pair in
+`prompts/<name>/`. Each target gets its own image (`mutant-harness-<name>`) and
+verify volume (`mutant-harness-build` for core, `mutant-harness-build-<name>`
+otherwise). Adding a target is one profile and two prompts.
+
+Inside the container the tree is always at `/src/bitcoin` and the variables
+keep their `BITCOIN_*` names, whatever the target; `--update-core` refreshes
+whichever tree it is. `--verify-only` refuses a run made with another target.
+
+libsecp256k1 differs from Core in ways that matter here:
+
+- **Almost all the code is headers** included into `src/secp256k1.c`. The
+  profile sets `TU_HEADER_UNITS` (`src/tests.c src/tests_exhaustive.c`), so
+  `tu-check` asks the preprocessor which of those units include the header and
+  syntax-checks them.
+- **Some files are never compiled.** The field and scalar implementations are
+  picked per platform: on x86_64 `field_10x26`, `scalar_8x32` and
+  `int128_struct` are dead. Every mutant there would come back `live` without
+  having been tested, so the run refuses them up front (`tu-check` exit 3).
+- **No functional suite; a constant-time check instead.** Verification is
+  `ctest` (unit and exhaustive tests), then `ctime_tests` under valgrind
+  (`mutant-verify --ctime`, on by default for this target). A constant-time
+  kill is recorded as `killed_by: "ctime"`. The image installs valgrind and
+  configures with `-DSECP256K1_VALGRIND=ON`, all modules on, benchmarks off.
+- **Different prompts.** The specs step reads BIP340/327/324/352, SEC1 and
+  `doc/`; mutants under `#ifdef VERIFY` are ruled out; `concurrency` is replaced
+  by a `constant-time` operator; the severity scale is about forgery, key
+  leakage and API contracts instead of consensus and p2p.
+
+A full libsecp256k1 build is well under a minute, so verifying is cheap next to
+Core's.
 
 ## Output
 
