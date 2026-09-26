@@ -152,6 +152,10 @@ fi
 [[ -d "$REPO/$BUILD_DIR" ]] || die "no build dir at $REPO/$BUILD_DIR (configure it first: cmake -B $BUILD_DIR)"
 
 FUNCTIONAL_RUNNER="$BUILD_DIR/test/functional/test_runner.py"
+# Under --failfast, test_runner.py prints its results table and then SIGKILLs its
+# own process group. With stdout going to a log, Python would still be holding
+# that table in its buffer when it dies, so failed_tests would find nothing.
+export PYTHONUNBUFFERED=1
 CTIME_RUNNER="$BUILD_DIR/bin/ctime_tests"
 if [[ "$CTIME" == 1 ]]; then
     command -v valgrind >/dev/null || die "--ctime needs valgrind on PATH"
@@ -170,7 +174,7 @@ run_stage() {  # run_stage <log> <timeout-or-empty> <cmd...>
         if [[ -n "$tmo" ]]; then
             timeout --signal=TERM "$tmo" "$@" 2>&1
         else
-            "$@" 2>&1
+            setsid --wait "$@" 2>&1
         fi
     } >>"$log" 2>&1 || rc=$?
     return "$rc"
@@ -372,26 +376,32 @@ for patch in "${PATCHES[@]}"; do
         continue
     fi
 
+    # --failfast stops at the first failure. When that failure turns out to be a
+    # flake, the rest of the suite never ran, so run it again until it passes or
+    # a test fails twice.
     log "$id: functional tests"
-    mark=$(log_mark "$plog")
-    rc=0; run_stage "$plog" "$FUNCTIONAL_TIMEOUT" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" ${FUNCTIONAL_ARGS[@]+"${FUNCTIONAL_ARGS[@]}"} || rc=$?
-    if (( rc != 0 )); then
+    killed=0
+    while :; do
+        mark=$(log_mark "$plog")
+        rc=0; run_stage "$plog" "$FUNCTIONAL_TIMEOUT" "$REPO/$FUNCTIONAL_RUNNER" -j "$JOBS" --failfast ${FUNCTIONAL_ARGS[@]+"${FUNCTIONAL_ARGS[@]}"} || rc=$?
+        (( rc != 0 )) || break
         failed=()
         while IFS= read -r t; do failed+=("$t"); done < <(failed_tests "$plog" "$mark" functional)
         rc2=1
         if (( ${#failed[@]} )); then
             rc2=0; rerun_failed "$plog" "$FUNCTIONAL_TIMEOUT" functional "${failed[@]}" || rc2=$?
         fi
-        if (( rc2 != 0 )); then
-            log "$id: \033[31mdead\033[0m (functional: ${failed[*]:-unattributed})"
-            KILLED_TESTS=(${failed[@]+"${failed[@]}"})
-            record "$id" dead functional "$rc" $(( $(date +%s) - started )) "killed by the functional test suite"
-            DEAD=$((DEAD + 1))
-            revert
-            continue
-        fi
-        warn "$id: ${failed[*]} failed then passed on re-run - flaky, not a kill"
-        FLAKY+=(functional)
+        if (( rc2 != 0 )); then killed=1; break; fi
+        warn "$id: ${failed[*]} failed then passed on re-run - flaky, not a kill; running the suite again"
+        [[ " ${FLAKY[*]-} " == *" functional "* ]] || FLAKY+=(functional)
+    done
+    if (( killed )); then
+        log "$id: \033[31mdead\033[0m (functional: ${failed[*]:-unattributed})"
+        KILLED_TESTS=(${failed[@]+"${failed[@]}"})
+        record "$id" dead functional "$rc" $(( $(date +%s) - started )) "killed by the functional test suite"
+        DEAD=$((DEAD + 1))
+        revert
+        continue
     fi
 
     log "$id: \033[32mLIVE\033[0m - the whole suite passed"
