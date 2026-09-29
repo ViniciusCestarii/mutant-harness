@@ -23,6 +23,7 @@ mutant-harness --file src/net_processing.cpp --count 20 --focus "compact blocks"
 mutant-harness --file src/pow.cpp --verify                 # build and test the mutants
 mutant-harness --file src/pow.cpp --verify --export        # write live mutants to out/import.json
 mutant-harness --target secp256k1 --file src/group_impl.h --verify
+mutant-harness --file src/validation.cpp --pr 12345        # mutate a pull request's head
 mutant-harness --verify-only results/src-pow-cpp-latest --verify-arg --resume
 mutant-harness --apply results/.../out/patches/mut-003.patch --repo ~/src/bitcoin
 ```

@@ -16,7 +16,7 @@ ARG CLONE_DEPTH=1
 LABEL org.mutant-harness.kind="core-mutant-gen"
 # Bump when the image gains something a run now depends on; the harness rebuilds
 # any older image rather than failing inside the container.
-LABEL org.mutant-harness.version="4"
+LABEL org.mutant-harness.version="5"
 LABEL org.mutant-harness.target="${TARGET_NAME}"
 
 ENV DEBIAN_FRONTEND=noninteractive

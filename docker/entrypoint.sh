@@ -27,6 +27,7 @@ FOCUS="${FOCUS:-}"
 LINE_RANGE="${LINE_RANGE:-}"
 OPS="${OPS:-}"
 UPDATE_CORE="${UPDATE_CORE:-0}"
+PR="${PR:-}"
 UPDATE_BIPS="${UPDATE_BIPS:-0}"
 TARGET_NAME="${TARGET_NAME:-core}"
 CMAKE_FLAGS="${CMAKE_FLAGS:-}"
@@ -51,6 +52,15 @@ if [[ "$UPDATE_CORE" == "1" ]]; then
     git -C "$BITCOIN_SRC" fetch --depth 1 origin master \
         && git -C "$BITCOIN_SRC" reset --hard FETCH_HEAD \
         || log "warning: refresh failed, using the baked-in clone"
+fi
+
+# Unlike --update-core, a failed fetch is fatal: mutating master when a PR was
+# asked for would be a silently wrong run.
+if [[ -n "$PR" ]]; then
+    log "fetching $TARGET_NAME pull request #$PR..."
+    git -C "$BITCOIN_SRC" fetch --depth 1 origin "pull/$PR/head" \
+        && git -C "$BITCOIN_SRC" reset --hard FETCH_HEAD \
+        || die "cannot fetch pull request #$PR"
 fi
 
 if [[ "$UPDATE_BIPS" == "1" ]]; then
@@ -104,7 +114,7 @@ fi
 # and that is all it takes to stop guessing whether a mutant is valid C++.
 # `tu-check` needs a build dir configured against *this* commit. The baked-in
 # one matches unless the clone was swapped (--repo) or refreshed
-# (--update-core); CMake will not reuse a cache that points at another source
+# (--update-core, --pr); CMake will not reuse a cache that points at another source
 # tree, so reconfigure into a throwaway dir in those cases.
 #
 # Then check the *unpatched* file. If it does not compile clean - a missing
@@ -486,6 +496,7 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
        --arg focus "$FOCUS" \
        --argjson filelines "$TARGET_LINES" \
        --arg commit "$CORE_COMMIT" \
+       --arg pr "$PR" \
        --arg desc "$CORE_DESC" \
        --arg bipscommit "$BIPS_COMMIT" \
        --arg bipsdesc "$BIPS_DESC" \
@@ -498,7 +509,8 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
        '. + {target: ((.target // {}) + {file: $file, file_lines: $filelines,
                                          lines: (if $lines == "" then null else $lines end),
                                          focus: (if $focus == "" then null else $focus end)}),
-             repo: ((.repo // {}) + {commit: $commit, head: $desc}),
+             repo: ((.repo // {}) + {commit: $commit, head: $desc,
+                                     pr: (if $pr == "" then null else ($pr | tonumber) end)}),
              bips_repo: {commit: $bipscommit, head: $bipsdesc},
              harness: {target: $target, model: $model, requested_mutants: $requested,
                        compile_checked: ($compilecheck == 1),

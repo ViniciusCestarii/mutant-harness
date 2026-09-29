@@ -27,7 +27,7 @@ git config --global user.email "harness@localhost" 2>/dev/null || true
 git config --global user.name "mutant-harness" 2>/dev/null || true
 
 # A mutant patch applies to exactly one commit. The image's clone is that commit
-# unless the generation run refreshed it (--update-core), which happened in a
+# unless the generation run refreshed it (--update-core, --pr), which happened in a
 # different container and did not persist - so put the tree back rather than
 # reporting every mutant as apply-failed.
 if [[ -n "$VERIFY_COMMIT" ]]; then

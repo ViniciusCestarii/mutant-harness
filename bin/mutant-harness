@@ -30,6 +30,7 @@ VERIFY_ONLY_DIR=""
 EXPORT=0
 REBUILD=0
 UPDATE_CORE=0
+PR=""
 UPDATE_BIPS=0
 SHELL_MODE=0
 TIMEOUT=""
@@ -88,6 +89,8 @@ Options:
   --export             After verification, write the live mutants to
                        out/import.json with bin/mutant-export
   --update-core        git fetch master inside the container first
+  --pr <n>             Mutate the head of GitHub pull request <n> instead of
+                       master (fetched inside the container)
   --update-bips        git fetch the bips repo too
   --rebuild            Rebuild the docker image first
   --build-only         Build the image and exit
@@ -125,6 +128,7 @@ while [[ $# -gt 0 ]]; do
         --verify-only)    VERIFY_ONLY_DIR="${2:?}"; shift 2 ;;
         --export)         EXPORT=1; shift ;;
         --update-core)    UPDATE_CORE=1; shift ;;
+        --pr)             PR="${2:?}"; shift 2 ;;
         --update-bips)    UPDATE_BIPS=1; shift ;;
         --rebuild)        REBUILD=1; shift ;;
         --build-only)     BUILD_ONLY=1; shift ;;
@@ -297,7 +301,7 @@ build_image() {
 }
 
 # What this harness needs the image to contain. Bumped in the Dockerfile too.
-IMAGE_VERSION=4
+IMAGE_VERSION=5
 
 image_label() {
     docker image inspect "$IMAGE" --format "{{index .Config.Labels \"$1\"}}" 2>/dev/null
@@ -349,6 +353,8 @@ TARGET_FILE="${TARGET_FILE#./}"
 [[ "$TARGET_FILE" != *..* ]] || die "--file must not contain '..': $TARGET_FILE"
 [[ "$COUNT" =~ ^[0-9]+$ ]] && (( COUNT > 0 )) || die "--count takes a positive number, got: $COUNT"
 [[ -z "$LINE_RANGE" || "$LINE_RANGE" =~ ^[0-9]+-[0-9]+$ ]] || die "--lines takes a-b, got: $LINE_RANGE"
+[[ -z "$PR" || "$PR" =~ ^[0-9]+$ ]] || die "--pr takes a pull request number, got: $PR"
+[[ -z "$PR" || "$UPDATE_CORE" == 0 ]] || die "--pr and --update-core both pick the commit; pick one"
 
 SLUG="$(printf '%s' "$TARGET_FILE" | tr '/.' '--' | sed 's/^-*//')"
 
@@ -402,6 +408,7 @@ DOCKER_ARGS=(
     -e "MODEL=$MODEL"
     -e "FALLBACK_MODEL=$FALLBACK_MODEL"
     -e "UPDATE_CORE=$UPDATE_CORE"
+    -e "PR=$PR"
     -e "UPDATE_BIPS=$UPDATE_BIPS"
     -e "HOME=/home/agent"
 )
