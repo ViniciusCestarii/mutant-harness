@@ -144,7 +144,7 @@ done
 
 # --------------------------------------------------------------- target ----
 # Everything that differs between targets - repo, image, cmake flags, header
-# check units, default verify args - lives in one profile.
+# check units, verify stages - lives in one profile.
 PROFILE="$HERE/targets/$TARGET.env"
 [[ "$TARGET" =~ ^[a-z0-9_-]+$ && -r "$PROFILE" ]] \
     || die "unknown --target $TARGET (have: $(cd "$HERE/targets" && ls *.env | sed 's/\.env$//' | tr '\n' ' '))"
@@ -158,11 +158,8 @@ if [[ "$TARGET_NAME" == core ]]; then
 else
     VERIFY_VOLUME="${MUTANT_HARNESS_BUILD_VOLUME:-mutant-harness-build-$TARGET_NAME}"
 fi
-# The profile's verify args go first so a --verify-arg can still add to them.
-if [[ -n "$VERIFY_DEFAULT_ARGS" ]]; then
-    read -r -a _defaults <<< "$VERIFY_DEFAULT_ARGS"
-    VERIFY_ARGS=("${_defaults[@]}" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"})
-fi
+# The profile's stages go first so a --verify-arg can still add to them.
+VERIFY_ARGS=(--stages "$VERIFY_STAGES" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"})
 # A run can only be verified in the image of the target it was cut from; say so
 # before building or starting the wrong one.
 if [[ -n "$VERIFY_ONLY_DIR" ]] && command -v jq >/dev/null; then

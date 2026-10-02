@@ -49,6 +49,8 @@ Options:
   --skip-functional      Stop after ctest; survivors are reported as `live-unit`
   --ctime                Replace the functional stage with secp256k1's constant-time
                          check: valgrind --error-exitcode=42 <build>/bin/ctime_tests
+  --stages <list>        Stages after the build: "ctest functional" (default),
+                         "ctest ctime" (= --ctime) or "ctest" (= --skip-functional)
   --ctest-arg <arg>      Extra arg for ctest (repeatable)
   --functional-arg <arg> Extra arg for test_runner.py (repeatable), e.g.
                          --functional-arg feature_taproot.py
@@ -85,6 +87,14 @@ while [[ $# -gt 0 ]]; do
         --only)           ONLY="${2:?}"; shift 2 ;;
         --skip-functional) SKIP_FUNCTIONAL=1; shift ;;
         --ctime)          CTIME=1; shift ;;
+        --stages)
+            case "${2:?}" in
+                "ctest")            SKIP_FUNCTIONAL=1 ;;
+                "ctest functional") ;;
+                "ctest ctime")      CTIME=1 ;;
+                *) die "--stages takes \"ctest\", \"ctest functional\" or \"ctest ctime\", got: $2" ;;
+            esac
+            shift 2 ;;
         --ctest-arg)      CTEST_ARGS+=("${2:?}"); shift 2 ;;
         --functional-arg) FUNCTIONAL_ARGS+=("${2:?}"); shift 2 ;;
         --baseline)       BASELINE=1; BASELINE_SET=1; shift ;;

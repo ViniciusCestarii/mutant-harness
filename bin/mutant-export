@@ -33,6 +33,12 @@ OPERATORS = {
     "early-exit": "RETURN_VALUE",
 }
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+# What each of a profile's VERIFY_STAGES runs, as bin/mutant-verify runs it.
+STAGE_COMMANDS = {
+    "ctest": "ctest --test-dir build -j$(nproc)",
+    "functional": "build/test/functional/test_runner.py -j$(nproc) --failfast",
+    "ctime": "valgrind --error-exitcode=42 build/bin/ctime_tests",
+}
 
 
 def die(msg):
@@ -161,7 +167,10 @@ def main():
             r = json.loads(line)
             status[r["id"]] = r["status"]
 
-    old = read_file_at(commit, target, args.repo, profile["GITHUB_REPO"]).splitlines()
+    github = re.search(r"github\.com[/:](.+?)(?:\.git)?$", profile["REPO_URL"])
+    if not github:
+        die(f"REPO_URL {profile['REPO_URL']} is not on GitHub")
+    old = read_file_at(commit, target, args.repo, github.group(1)).splitlines()
 
     rows = []
     for m in manifest["mutants"]:
@@ -197,8 +206,9 @@ def main():
             "commit": commit,
             "buildCommand": f"cmake -B build {profile['CMAKE_FLAGS']}"
                             " && cmake --build build -j$(nproc)",
-            "testCommand": profile["TEST_COMMAND"],
-            "environment": profile["ENVIRONMENT"],
+            "testCommand": " && ".join(STAGE_COMMANDS[s] for s in profile["VERIFY_STAGES"].split()),
+            "environment": ", ".join(["Debian bookworm", "GCC (build-essential)", "cmake"]
+                                     + profile["APT_PACKAGES"].split()),
             "observedResult": "SURVIVED",
         },
         "mutants": rows,
