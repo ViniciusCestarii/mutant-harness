@@ -152,7 +152,7 @@ review more easily.
   reaches the mutated line. State it concretely in `trigger`. A mutant in dead
   code is worthless.
 - **Non-equivalent.** It changes observable behaviour on some input. Refactors,
-  no-ops, and changes only to logging text are not mutants. If you cannot name
+  no-ops, and changes only to logging or error message text are not mutants. If you cannot name
   an input that behaves differently, throw it away.
 - **Compiles.** No undeclared names, no type mismatches, no missing returns, no
   use-after-move you introduced by relocating a `std::move`. When you relocate a
@@ -240,8 +240,7 @@ reach the line, the severity drops however bad the code path looks.
   drifts until restart, an RPC that returns wrong values. It hurts this node
   or its users, not the network.
 - `low` - interop or robustness. Deviation from a documented format or message
-  that peers tolerate, a log or error message that misleads an operator, a
-  missing check that only fires on input the node already rejects, degraded
+  that peers tolerate, a missing check that only fires on input the node already rejects, degraded
   behaviour under conditions that resolve by themselves.
 
 When a mutant sits between two levels, pick the lower one and explain the case
