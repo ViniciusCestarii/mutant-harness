@@ -16,7 +16,7 @@ ARG CLONE_DEPTH=1
 LABEL org.mutant-harness.kind="core-mutant-gen"
 # Bump when the image gains something a run now depends on; the harness rebuilds
 # any older image rather than failing inside the container.
-LABEL org.mutant-harness.version="12"
+LABEL org.mutant-harness.version="13"
 LABEL org.mutant-harness.target="${TARGET_NAME}"
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -39,7 +39,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ${APT_PACKAGES} \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
+ARG AGENT=claude
+LABEL org.mutant-harness.agent="${AGENT}"
+
+RUN case "$AGENT" in \
+        claude) npm install -g @anthropic-ai/claude-code ;; \
+        codex)  npm install -g @openai/codex ;; \
+        *) echo "unknown agent: $AGENT" >&2; exit 1 ;; \
+    esac && npm cache clean --force
 
 # --rebuild sets this to a fresh value so the clones below are redone; otherwise
 # Docker reuses the cached layer and the "rebuilt" image keeps an old checkout.
@@ -93,6 +100,7 @@ COPY verify-entrypoint.sh /usr/local/bin/verify-entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-entrypoint.sh
 
 ENV HOME=/home/agent \
+    AGENT=${AGENT} \
     CLAUDE_CONFIG_DIR=/home/agent/.claude \
     BITCOIN_SRC=/src/bitcoin \
     BITCOIN_BUILD=/src/build \

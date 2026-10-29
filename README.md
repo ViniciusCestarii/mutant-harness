@@ -1,6 +1,6 @@
 # mutant-harness
 
-Runs Claude Code in a disposable Docker container to plant plausible bugs (mutants) in one file of Bitcoin Core or libsecp256k1. Each mutant ships as a `git` patch plus a manifest explaining what it breaks and why the tests might miss it.
+Runs Claude Code or Codex in a disposable Docker container to plant plausible bugs (mutants) in one file of Bitcoin Core or libsecp256k1. Each mutant ships as a `git` patch plus a manifest explaining what it breaks and why the tests might miss it.
 
 Tools like `bcore-mutation` apply fixed single-line changes (`<` to `<=`, delete a statement). This harness instead reads the file, the BIPs it implements and its tests, then plants a few targeted mutants where impact is high and coverage is thin. It can make changes a line-level tool cannot: move a statement past its guard, hoist a block out of a branch, reorder validations or drop a `return false` in a loop. The two approaches find different gaps and make different trade-offs, so run both.
 
@@ -8,14 +8,44 @@ Tools like `bcore-mutation` apply fixed single-line changes (`<` to `<=`, delete
 
 Requires `docker` and `jq`.
 
+Claude is the default agent; no environment variable is required to select it.
+To use GPT via Codex, run `export AGENT=codex` before building the image and keep
+it exported for subsequent runs. Set it again if you open a new terminal.
+The image installs only the selected agent.
+
 ```sh
 git clone https://github.com/ViniciusCestarii/mutant-harness.git && cd mutant-harness
+# For Codex only (skip this line to use the default, Claude):
+# export AGENT=codex
 ./bin/mutant-harness --build-only
 ln -s "$PWD/bin/mutant-harness" ~/.local/bin/mutant-harness
 ln -s "$PWD/bin/mutant-verify"  ~/.local/bin/mutant-verify
 ```
 
+`--build-only` does not require credentials. The harness also builds the image
+automatically when needed, including when you switch `AGENT`.
+
 ## Usage
+
+Before generating mutants, provide the API key for your selected agent.
+For Claude:
+
+```sh
+export ANTHROPIC_API_KEY="your-anthropic-api-key"
+```
+
+For Codex:
+
+```sh
+export OPENAI_API_KEY="your-openai-api-key"
+```
+
+Alternatively, reuse an existing local CLI login. Without an API key, the
+harness copies Claude's login cache or Codex's `auth.json` into the container.
+Codex's cache is read from `CODEX_HOME` (default: `~/.codex`) and must be file
+based; OS keyring credentials are not copied. With `OPENAI_API_KEY`, the harness
+runs `codex login --with-api-key` inside the container before starting Codex.
+If neither a key nor a login cache is available, the run stops with an error.
 
 ```sh
 mutant-harness --file src/script/interpreter.cpp
@@ -31,6 +61,12 @@ mutant-harness --apply results/.../out/patches/mut-003.patch --repo ~/src/bitcoi
 ```
 
 All flags: `mutant-harness --help` and `mutant-verify --help`.
+
+Claude is the default agent, with `opus` as its default model.
+Codex's default model is `gpt-6-astra`.
+`--model` overrides either default, and `--review-model` defaults to the
+generation model. The selected agent runs both generation and review, including
+`--review-only`. `--fallback-model` is supported only by Claude.
 
 ## Output
 
@@ -59,7 +95,8 @@ results/<file-slug>-<timestamp>/out/
 
 ## Notes
 
-- The agent runs with full permissions inside the container. The container is not network isolated, since Claude Code needs to reach the Anthropic API.
+- The agent runs with full permissions inside the container. The container is not network isolated, since the agent needs to reach its provider's API.
 - With `--repo`, the agent edits your clone. Use a scratch clone.
-- Auth uses `ANTHROPIC_API_KEY` if set. Otherwise each run copies `~/.claude/.credentials.json` into `work/claude-home/`, so a run folder contains a live login token. Don't share run folders as-is. Share `out/` only.
+- Claude auth uses `ANTHROPIC_API_KEY` if set. Otherwise each run copies `~/.claude/.credentials.json` into `work/claude-home/`. Codex login caches are copied into `work/codex-home/`. Run folders using login caches contain live tokens. Don't share run folders as-is. Share `out/` only.
+- Codex logs token usage rather than a dollar cost. Its `cost_usd` values in `summary.json` are `null`, including totals containing an unknown cost. Token usage is preserved in the session/review logs.
 - The verify build tree lives in a Docker volume (`mutant-harness-build`, a few GB).

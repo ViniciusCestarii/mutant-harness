@@ -19,7 +19,13 @@ PATCH_DIR="${PATCH_DIR:-$OUT_DIR/patches}"
 PROMPT_TEMPLATE="${PROMPT_TEMPLATE:-/work/prompt.md}"
 REVIEW_PROMPT_TEMPLATE="${REVIEW_PROMPT_TEMPLATE:-/work/review.md}"
 REVIEW="${REVIEW:-1}"
-MODEL="${MODEL:-opus}"
+AGENT="${AGENT:-claude}"
+MODEL="${MODEL:-}"
+case "$AGENT" in
+    claude) MODEL="${MODEL:-opus}" ;;
+    codex)  MODEL="${MODEL:-gpt-6-astra}" ;;
+    *)      echo "invalid AGENT: $AGENT" >&2; exit 1 ;;
+esac
 REVIEW_MODEL="${REVIEW_MODEL:-$MODEL}"
 FALLBACK_MODEL="${FALLBACK_MODEL:-}"
 MUTANT_COUNT="${MUTANT_COUNT:-12}"
@@ -45,6 +51,10 @@ die() { printf '[harness] error: %s\n' "$*" >&2; exit 1; }
 mkdir -p "$OUT_DIR" "$PATCH_DIR" /work
 export HOME="${HOME:-/home/agent}"
 mkdir -p "$HOME"
+if [[ "$AGENT" == codex && -n "${OPENAI_API_KEY:-}" ]]; then
+    printenv OPENAI_API_KEY | codex login --with-api-key >/dev/null \
+        || die "Codex API key login failed"
+fi
 git config --global --add safe.directory "$BITCOIN_SRC" 2>/dev/null || true
 git config --global --add safe.directory "$BIPS_SRC" 2>/dev/null || true
 git config --global user.email "harness@localhost" 2>/dev/null || true
@@ -371,20 +381,26 @@ PY
     [[ -s "$2" ]] || die "failed to render prompt $1"
 }
 
-# run_claude <prompt> <stream_log> <model> <add-dir>...
-run_claude() {
+# run_agent <prompt> <stream_log> <model> <add-dir>...
+run_agent() {
     local prompt="$1" stream="$2" model="$3"; shift 3
-    local args=(-p --model "$model" --dangerously-skip-permissions
-                --output-format stream-json --verbose)
+    local args=()
+    if [[ "$AGENT" == codex ]]; then
+        args=(exec --model "$model" --dangerously-bypass-approvals-and-sandbox --json)
+    else
+        args=(-p --model "$model" --dangerously-skip-permissions
+              --output-format stream-json --verbose)
+        [[ -n "$FALLBACK_MODEL" ]] && args+=(--fallback-model "$FALLBACK_MODEL")
+    fi
     local d; for d in "$@"; do args+=(--add-dir "$d"); done
-    [[ -n "$FALLBACK_MODEL" ]] && args+=(--fallback-model "$FALLBACK_MODEL")
-    claude "${args[@]}" < "$prompt" > "$stream"
+    "$AGENT" "${args[@]}" < "$prompt" > "$stream"
 }
 
 # Human-readable trace of what an agent did, alongside the raw stream.
 make_trace() {
     [[ -s "$1" ]] || return 0
     jq -r '
+      # Claude stream events.
       if .type == "assistant" then
         (.message.content[]? |
           if .type == "text" then "\n=== assistant ===\n" + .text
@@ -394,6 +410,18 @@ make_trace() {
         "\n=== result ===\nsubtype=" + (.subtype // "?") +
         " turns=" + ((.num_turns // 0) | tostring) +
         " cost_usd=" + ((.total_cost_usd // 0) | tostring)
+      # Codex stream events.
+      elif .type == "item.completed" then
+        (.item |
+          if .type == "agent_message" then "\n=== assistant ===\n" + .text
+          elif .type == "command_execution" then
+            "--- command: " + .command + "\n" + ((.aggregated_output // "")[0:400])
+          elif .type == "file_change" then "--- changes: " + (.changes | tostring)
+          else empty end)
+      elif .type == "turn.completed" then
+        "\n=== result ===\nusage=" + (.usage | tostring)
+      elif .type == "turn.failed" or .type == "error" then
+        "\n=== error ===\n" + ((.error // .message) | tostring)
       else empty end
     ' "$1" > "$2" 2>/dev/null || true
 }
@@ -404,7 +432,10 @@ recover_json() {
     local stream="$1" dest="$2"
     [[ -s "$dest" ]] && return 0
     log "no file at $dest; attempting recovery from final message"
-    jq -r 'select(.type == "result") | .result // empty' "$stream" 2>/dev/null \
+    jq -nr 'reduce inputs as $e ("";
+        if $e.type == "result" then $e.result // .
+        elif $e.type == "item.completed" and $e.item.type == "agent_message" then $e.item.text
+        else . end)' "$stream" 2>/dev/null \
         | sed -e 's/^```json$//' -e 's/^```$//' \
         | python3 -c '
 import sys, json, re
@@ -680,7 +711,7 @@ run_review_pass() {
         local stream="$OUT_DIR/review.stream.jsonl"
         log "reviewing $count mutants in a fresh session (model=$REVIEW_MODEL) ..."
         local start; start=$(date +%s)
-        run_claude "$dir/prompt.md" "$stream" "$REVIEW_MODEL" "$dir" "$BIPS_SRC"
+        run_agent "$dir/prompt.md" "$stream" "$REVIEW_MODEL" "$dir" "$BIPS_SRC"
         local rc=$?; elapsed=$(( $(date +%s) - start ))
         log "reviewer exited rc=$rc after ${elapsed}s"
 
@@ -712,10 +743,10 @@ run_review_pass() {
     after=$(jq -r '[.mutants[]?.id] | sort | @csv' "$OUT_REVIEWED")
     [[ "$before" == "$after" ]] || log "warning: reviewer changed the mutant set"
 
-    jq --arg model "$REVIEW_MODEL" \
+    jq --arg model "$REVIEW_MODEL" --arg agent "$AGENT" \
        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        --argjson elapsed "$elapsed" \
-       '. + {review: {model: $model, finished_at: $ts,
+       '. + {review: {agent: $agent, model: $model, finished_at: $ts,
                       duration_seconds: $elapsed,
                       good:          [.mutants[]? | select(.verdict == "good")]          | length,
                       dead:          [.mutants[]? | select(.verdict == "dead")]          | length,
@@ -749,12 +780,12 @@ rm -f "$PATCH_DIR"/*.patch 2>/dev/null
 STREAM_LOG="$OUT_DIR/session.stream.jsonl"
 cd "$BITCOIN_SRC" || die "cannot enter $BITCOIN_SRC"
 
-log "starting claude (model=$MODEL) ..."
+log "starting $AGENT (model=$MODEL) ..."
 START=$(date +%s)
-run_claude "$PROMPT_RENDERED" "$STREAM_LOG" "$MODEL" "$OUT_DIR" /work "$BIPS_SRC"
-CLAUDE_RC=$?
+run_agent "$PROMPT_RENDERED" "$STREAM_LOG" "$MODEL" "$OUT_DIR" /work "$BIPS_SRC"
+AGENT_RC=$?
 ELAPSED=$(( $(date +%s) - START ))
-log "claude exited rc=$CLAUDE_RC after ${ELAPSED}s"
+log "$AGENT exited rc=$AGENT_RC after ${ELAPSED}s"
 
 make_trace "$STREAM_LOG" "$OUT_DIR/session.txt"
 recover_json "$STREAM_LOG" "$REPORT_FILE"
@@ -779,6 +810,7 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
        --arg bipscommit "$BIPS_COMMIT" \
        --arg bipsdesc "$BIPS_DESC" \
        --arg model "$MODEL" \
+       --arg agent "$AGENT" \
        --arg target "$TARGET_NAME" \
        --argjson requested "$MUTANT_COUNT" \
        --argjson compilecheck "$COMPILE_CHECK" \
@@ -791,7 +823,7 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
              repo: ((.repo // {}) + {commit: $commit, head: $desc,
                                      pr: (if $pr == "" then null else ($pr | tonumber) end)}),
              bips_repo: {commit: $bipscommit, head: $bipsdesc},
-             harness: {target: $target, model: $model, requested_mutants: $requested,
+             harness: {target: $target, agent: $agent, model: $model, requested_mutants: $requested,
                        compile_checked: ($compilecheck == 1),
                        structural: ($structural == 1),
                        finished_at: $ts, duration_seconds: $elapsed}}' \
@@ -830,4 +862,4 @@ if [[ -s "$REPORT_FILE" ]] && jq empty "$REPORT_FILE" 2>/dev/null; then
 fi
 
 log "no valid report JSON produced (see $STREAM_LOG)"
-exit "${CLAUDE_RC:-1}"
+exit "${AGENT_RC:-1}"

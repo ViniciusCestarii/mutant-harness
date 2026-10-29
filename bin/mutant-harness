@@ -10,6 +10,7 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="core"
+AGENT="${AGENT:-claude}"
 
 TARGET_FILE=""
 COUNT=""
@@ -18,7 +19,6 @@ LINE_RANGE=""
 OPS=""
 STRUCTURAL=0
 OUT_ROOT="$PWD/results"
-MODEL="opus"
 REVIEW=0
 REVIEW_MODEL=""
 FALLBACK_MODEL=""
@@ -46,6 +46,11 @@ NO_CACHE=0
 log()  { printf '\033[36m[mutant-harness]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33m[mutant-harness]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m[mutant-harness]\033[0m %s\n' "$*" >&2; exit 1; }
+case "$AGENT" in
+    claude) MODEL="opus" ;;
+    codex)  MODEL="gpt-6-astra" ;;
+    *)      die "AGENT must be claude or codex, got: $AGENT" ;;
+esac
 # Wall time since the script started, image build included. Trapped on EXIT
 # once a run starts, so every way out of it reports.
 report_time() {
@@ -55,9 +60,12 @@ report_time() {
 }
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-cost_of() {  # cost_of <stream>: what the agent of one stream-json log cost, in USD
+cost_of() {  # cost_of <stream>: what the agent of one stream-json log cost, in USD, or null when the CLI reports no cost
     [[ -s "$1" ]] || { echo 0; return; }
-    jq -n '[inputs | select(.type == "result") | .total_cost_usd // 0] | add // 0' "$1" 2>/dev/null || echo 0
+    jq -n '[inputs |
+        if .type == "result" then .total_cost_usd // 0
+        elif .type == "thread.started" or .type == "turn.completed" or .type == "turn.failed" or .type == "error" then null
+        else empty end] | if any(.[]; . == null) then null else add // 0 end' "$1" 2>/dev/null || echo null
 }
 
 # One JSON for the whole run (SUMMARY_DIRS, written to SUMMARY_FILE): wall time,
@@ -92,13 +100,14 @@ write_summary() {  # write_summary <exit-code>
               --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               --argjson secs "$SECONDS" --argjson rc "$1" '
         def sum_counts: reduce (.[] | select(.) | to_entries[]) as $e ({}; .[$e.key] += $e.value);
+        def sum_costs: if any(.[]; . == null) then null else add end;
         {pr: (if $pr == "" then null else ($pr | tonumber) end),
          commit: (map(.commit) | map(select(.)) | first),
          started_at: $started, finished_at: $finished, duration_seconds: $secs,
          exit_code: $rc,
-         cost_usd: {generation: (map(.cost_usd.generation) | add),
-                    review:     (map(.cost_usd.review) | add),
-                    total:      (map(.cost_usd.generation + .cost_usd.review) | add)},
+         cost_usd: {generation: (map(.cost_usd.generation) | sum_costs),
+                    review:     (map(.cost_usd.review) | sum_costs),
+                    total:      ([.[] | .cost_usd.generation, .cost_usd.review] | sum_costs)},
          mutants: {generated:      (map(.mutants.generated) | add),
                    apply_failed:   (map(.mutants.apply_failed) | add),
                    compile_failed: (map(.mutants.compile_failed) | add),
@@ -111,7 +120,7 @@ write_summary() {  # write_summary <exit-code>
 
 usage() {
     cat >&2 <<'EOF'
-mutant-harness - run Claude Code in a container to plant mutants in one file
+mutant-harness - run Claude Code or Codex in a container to plant mutants in one file
 
 Usage:
   mutant-harness [--target <name>] --file <path-in-tree> [options]
@@ -143,14 +152,15 @@ Options:
   --out <dir>          Output root (default: ./results); results land in
                        <dir>/<file-slug>-<timestamp>/, or with --pr in
                        <dir>/pr-<n>-<timestamp>/<file-slug>/.
-  --model <name>       Model for the mutator (default: opus)
+  --model <name>       Model for the mutator (default: opus for Claude,
+                       gpt-6-astra for Codex)
   --review             Run the second-pass review of the mutants (default: off).
                        With verification it runs after it, on the survivors.
   --review-model <n>   Model for the review pass (default: same as --model)
   --review-only <dir>  Review an existing run directory's mutants and exit: no
                        generation, no verification. A --pr run's directory
                        reviews each of its files at once.
-  --fallback-model <n> Fallback when the primary is overloaded
+  --fallback-model <n> Fallback when the primary is overloaded (Claude only)
   --repo <path>        Mount a host clone of the target instead of the baked-in one
   --bips-repo <path>   Mount a host bitcoin/bips clone instead of the baked-in one
   --verify             When the run finishes, build and test every mutant that
@@ -188,8 +198,10 @@ Options:
   --apply <patch>      Apply one produced patch to --repo and exit (no container)
   -h, --help           This help
 
-Auth: uses ANTHROPIC_API_KEY if set, otherwise copies ~/.claude/.credentials.json
-into the run directory and mounts it (the host file is never modified).
+Agent: AGENT=claude (default) or codex.
+Auth: Claude uses ANTHROPIC_API_KEY or a copy of ~/.claude/.credentials.json.
+Codex uses OPENAI_API_KEY or a copy of ~/.codex/auth.json
+(under CODEX_HOME when set). Host credential files are never modified.
 EOF
 }
 
@@ -234,6 +246,7 @@ while [[ $# -gt 0 ]]; do
         *)                die "unknown option: $1 (try --help)" ;;
     esac
 done
+[[ "$AGENT" != codex || -z "$FALLBACK_MODEL" ]] || die "--fallback-model is only supported by Claude"
 # The run directory --verify-only or --review-only works on.
 ONLY_DIR="${VERIFY_ONLY_DIR:-$REVIEW_ONLY_DIR}"
 
@@ -417,6 +430,7 @@ build_image() {
     local bust=()
     [[ "$REBUILD" == 1 ]] && bust=(--build-arg "CLONE_CACHE_BUST=$(date +%s)")
     docker build -t "$IMAGE" ${bust[@]+"${bust[@]}"} \
+        --build-arg "AGENT=$AGENT" \
         --build-arg "TARGET_NAME=$TARGET_NAME" \
         --build-arg "REPO_URL=$REPO_URL" \
         --build-arg "CMAKE_FLAGS=$CMAKE_FLAGS" \
@@ -426,7 +440,7 @@ build_image() {
 }
 
 # What this harness needs the image to contain. Bumped in the Dockerfile too.
-IMAGE_VERSION=12
+IMAGE_VERSION=13
 
 image_label() {
     docker image inspect "$IMAGE" --format "{{index .Config.Labels \"$1\"}}" 2>/dev/null
@@ -436,12 +450,13 @@ image_label() {
 # rather than silently running a stranger's entrypoint.
 image_is_ours()    { [[ "$(image_label org.mutant-harness.kind)" == "core-mutant-gen" \
                          && "$(image_label org.mutant-harness.target)" == "$TARGET_NAME" ]]; }
-image_is_current() { [[ "$(image_label org.mutant-harness.version)" == "$IMAGE_VERSION" ]]; }
+image_is_current() { [[ "$(image_label org.mutant-harness.version)" == "$IMAGE_VERSION" \
+                         && "$(image_label org.mutant-harness.agent)" == "$AGENT" ]]; }
 
 if [[ "$REBUILD" == 1 ]] || ! image_is_ours || ! image_is_current; then
     if docker image inspect "$IMAGE" >/dev/null 2>&1 && [[ "$REBUILD" == 0 ]]; then
         if image_is_ours; then
-            warn "$IMAGE predates this harness (needs v$IMAGE_VERSION); rebuilding"
+            warn "$IMAGE needs harness v$IMAGE_VERSION with agent $AGENT; rebuilding"
         else
             warn "$IMAGE exists but is not a mutant-harness image; rebuilding over it"
         fi
@@ -650,7 +665,7 @@ if [[ -n "$PR" && -z "$TARGET_FILE" ]]; then
         "$HERE/prompts/$TARGET_NAME"/*.md "$PROFILE" | git hash-object --stdin | cut -c1-12)"
     pids=() keys=()
     for f in "${files[@]}"; do
-        key="${blobs_of[$f]:-} $harness_key ${gen_args[*]}"
+        key="${blobs_of[$f]:-} $harness_key $AGENT $MODEL ${gen_args[*]}"
         keys+=("$key")
         prev=""
         [[ "$NO_CACHE" == 1 ]] || prev="$(cached_run "$f" "$key")"
@@ -812,7 +827,20 @@ cp "$HERE/prompts/$TARGET_NAME/review.md" "$WORK_DIR/review.md"
 
 # ------------------------------------------------------------------ auth ----
 AUTH_ARGS=()
-if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+if [[ "$AGENT" == codex ]]; then
+    if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+        log "auth: OPENAI_API_KEY"
+        AUTH_ARGS+=(-e "OPENAI_API_KEY=$OPENAI_API_KEY")
+    elif [[ -r "${CODEX_HOME:-$HOME/.codex}/auth.json" ]]; then
+        log "auth: copy of Codex auth.json (host file untouched)"
+        mkdir -p "$WORK_DIR/codex-home"
+        cp "${CODEX_HOME:-$HOME/.codex}/auth.json" "$WORK_DIR/codex-home/auth.json"
+        chmod 600 "$WORK_DIR/codex-home/auth.json"
+        AUTH_ARGS+=(-v "$(cd "$WORK_DIR/codex-home" && pwd):/home/agent/.codex")
+    else
+        die "no auth: set OPENAI_API_KEY or log in with Codex (auth.json)"
+    fi
+elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     log "auth: ANTHROPIC_API_KEY"
     AUTH_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
 elif [[ -r "$HOME/.claude/.credentials.json" ]]; then
@@ -850,6 +878,7 @@ DOCKER_ARGS=(
     -e "REVIEW_ONLY_COMMIT=$REVIEW_ONLY_COMMIT"
     -e "OUT_DIR=/out"
     -e "MODEL=$MODEL"
+    -e "AGENT=$AGENT"
     -e "FALLBACK_MODEL=$FALLBACK_MODEL"
     -e "UPDATE_CORE=$UPDATE_CORE"
     -e "PR=$PR"
