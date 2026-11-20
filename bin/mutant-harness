@@ -52,8 +52,45 @@ report_time() {
     local rc=$?
     log "finished in $((SECONDS / 60))m$((SECONDS % 60))s"
     if [[ -n "${SUMMARY_FILE:-}" ]]; then write_summary "$rc"; fi
+    if [[ -n "${RESULT_DIR:-}" ]]; then write_result; fi
 }
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# The one file to read, in RESULT_DIR: the mutants of SUMMARY_DIRS worth a look.
+# Its name says what vetted them: mutants-verified-reviewed.json keeps those
+# that survived the tests and the review called good. Everything else of a run
+# is in its debug/.
+write_result() {
+    command -v jq >/dev/null || return 0
+    local d m r v verified="" reviewed="" name dirs=()
+    for d in "${SUMMARY_DIRS[@]}"; do
+        [[ -s "$d/debug/mutants.json" ]] || continue
+        dirs+=("$(cd "$d" && pwd)")
+        [[ -s "$d/debug/verify/results.jsonl" ]] && verified="-verified"
+        [[ -s "$d/debug/mutants-reviewed.json" ]] && reviewed="-reviewed"
+    done
+    (( ${#dirs[@]} )) || return 0
+    name="mutants$verified$reviewed.json"
+    rm -f "$RESULT_DIR"/mutants{,-verified,-reviewed,-verified-reviewed}.json
+    for d in "${dirs[@]}"; do
+        m="$d/debug/mutants.json"
+        r="$d/debug/verify/results.jsonl";  [[ -s "$r" ]] || r=/dev/null
+        v="$d/debug/mutants-reviewed.json"; [[ -s "$v" ]] || v=/dev/null
+        jq -n --arg dir "$d/debug" --arg verified "$verified" --arg reviewed "$reviewed" \
+            --slurpfile m "$m" --slurpfile r "$r" --slurpfile v "$v" '
+            ($m[0].harness.structural // false) as $structural
+            | (reduce $r[] as $x ({}; .[$x.id] = $x.status)) as $status
+            | (reduce ($v[0].mutants // [])[] as $x ({}; .[$x.id] = $x.verdict)) as $verdict
+            | ($m[0].mutants // [])[]
+            | select(if $verified != "" then $status[.id] == "live" or $status[.id] == "live-unit"
+                     else .apply_ok and .compiles_ok != false and (.duplicate_of | not)
+                          and (($structural | not) or .line_level != true) end)
+            | select($reviewed == "" or $verdict[.id] == "good")
+            | {id, title, patch: "\($dir)/\(.patch)"}'
+    done | jq -s . > "$RESULT_DIR/$name" \
+        && log "result: $RESULT_DIR/$name ($(jq length "$RESULT_DIR/$name") mutants)   <- start here" \
+        || warn "could not write $RESULT_DIR/$name"
+}
 
 cost_of() {  # cost_of <stream>: what the agent of one stream-json log cost, in USD
     [[ -s "$1" ]] || { echo 0; return; }
@@ -67,11 +104,11 @@ write_summary() {  # write_summary <exit-code>
     command -v jq >/dev/null || return 0
     local d m r v gen rev
     for d in "${SUMMARY_DIRS[@]}"; do
-        m="$d/out/mutants.json";          [[ -s "$m" ]] || m=/dev/null
-        r="$d/out/verify/results.jsonl";  [[ -s "$r" ]] || r=/dev/null
-        v="$d/out/mutants-reviewed.json"; [[ -s "$v" ]] || v=/dev/null
-        gen=0; [[ -f "$d/reused-from" ]] || gen="$(cost_of "$d/out/session.stream.jsonl")"
-        rev="$(cost_of "$d/out/review.stream.jsonl")"
+        m="$d/debug/mutants.json";          [[ -s "$m" ]] || m=/dev/null
+        r="$d/debug/verify/results.jsonl";  [[ -s "$r" ]] || r=/dev/null
+        v="$d/debug/mutants-reviewed.json"; [[ -s "$v" ]] || v=/dev/null
+        gen=0; [[ -f "$d/reused-from" ]] || gen="$(cost_of "$d/debug/session.stream.jsonl")"
+        rev="$(cost_of "$d/debug/review.stream.jsonl")"
         jq -n --arg dir "$d" --arg reused "$(cat "$d/reused-from" 2>/dev/null)" \
             --argjson gen "$gen" --argjson rev "$rev" \
             --slurpfile m "$m" --slurpfile r "$r" --slurpfile v "$v" '
@@ -173,7 +210,7 @@ Options:
   --no-cache           With --pr, generate every file anew instead of reusing
                        the mutants of an earlier run of the same PR
   --export             After verification, write the live mutants to
-                       out/import.json with bin/mutant-export
+                       debug/import.json with bin/mutant-export
   --update-core        git fetch master inside the container first
   --pr <n>             Mutate the head of GitHub pull request <n> instead of
                        master (fetched inside the container), and only the
@@ -241,7 +278,7 @@ ONLY_DIR="${VERIFY_ONLY_DIR:-$REVIEW_ONLY_DIR}"
 if [[ -z "${MUTANT_HARNESS_PREFIXED:-}" && "$SHELL_MODE" == 0 && "$DETACH" == 0 && -z "$APPLY_PATCH" ]]; then
     prefix_file="$TARGET_FILE"
     if [[ -z "$prefix_file" && -n "$ONLY_DIR" ]] && command -v jq >/dev/null; then
-        for m in "$ONLY_DIR/out/mutants.json" "$ONLY_DIR/mutants.json"; do
+        for m in "$ONLY_DIR/debug/mutants.json" "$ONLY_DIR/mutants.json"; do
             [[ -f "$m" ]] || continue
             prefix_file="$(jq -r '.target.file // empty' "$m" 2>/dev/null || true)"
             break
@@ -254,6 +291,9 @@ if [[ -z "${MUTANT_HARNESS_PREFIXED:-}" && "$SHELL_MODE" == 0 && "$DETACH" == 0 
         exit "$rc"
     fi
 fi
+# A run of ourselves started from here leaves the result file to us.
+NESTED="${MUTANT_HARNESS_NESTED:-0}"
+export MUTANT_HARNESS_NESTED=1
 
 # --------------------------------------------------------------- target ----
 # Everything that differs between targets - repo, image, cmake flags, header
@@ -276,7 +316,7 @@ VERIFY_ARGS=(--stages "$VERIFY_STAGES" ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"})
 # A run can only be verified in the image of the target it was cut from; say so
 # before building or starting the wrong one.
 if [[ -n "$ONLY_DIR" ]] && command -v jq >/dev/null; then
-    for m in "$ONLY_DIR/out/mutants.json" "$ONLY_DIR/mutants.json"; do
+    for m in "$ONLY_DIR/debug/mutants.json" "$ONLY_DIR/mutants.json"; do
         [[ -f "$m" ]] || continue
         made_for="$(jq -r '.harness.target // "core"' "$m" 2>/dev/null || true)"
         [[ -z "$made_for" || "$made_for" == "$TARGET_NAME" ]] \
@@ -392,7 +432,7 @@ run_verification() {  # run_verification <out-dir> <container-name>
     export_live "$out_dir" "$rc" "$REPO_MOUNT"
 }
 
-# Finish a verification: write out/import.json when --export asked for it, then
+# Finish a verification: write debug/import.json when --export asked for it, then
 # exit with the verifier's code. A failed export only warns, it does not turn a
 # good verification into a failed one.
 export_live() {  # export_live <out-dir> <verify-rc> <core-clone-or-empty>
@@ -457,15 +497,16 @@ fi
 if [[ -n "$VERIFY_ONLY_DIR" ]]; then
     [[ -d "$VERIFY_ONLY_DIR" ]] || die "--verify-only $VERIFY_ONLY_DIR is not a directory"
     RUN_DIR="$(cd "$VERIFY_ONLY_DIR" && pwd)"
-    # Take either the run directory or its out/ directly.
-    if [[ -f "$RUN_DIR/out/mutants.json" ]]; then
-        VERIFY_OUT="$RUN_DIR/out"
+    # Take either the run directory or its debug/ directly.
+    if [[ -f "$RUN_DIR/debug/mutants.json" ]]; then
+        VERIFY_OUT="$RUN_DIR/debug"
     elif [[ -f "$RUN_DIR/mutants.json" ]]; then
         VERIFY_OUT="$RUN_DIR"
     else
         die "no mutants.json under $RUN_DIR (pass a run directory from results/)"
     fi
     log "verify only: $VERIFY_OUT"
+    [[ "$NESTED" == 1 ]] || { RESULT_DIR="$(dirname "$VERIFY_OUT")"; SUMMARY_DIRS=("$RESULT_DIR"); }
     trap report_time EXIT
     run_verification "$VERIFY_OUT" "mutant-harness-verify-$(basename "$RUN_DIR")"
 fi
@@ -479,9 +520,10 @@ if [[ -n "$REVIEW_ONLY_DIR" ]]; then
     [[ -z "$TARGET_FILE$PR$VERIFY_ONLY_DIR" ]] || die "--review-only takes no --file, --pr or --verify-only"
     [[ -d "$REVIEW_ONLY_DIR" ]] || die "--review-only $REVIEW_ONLY_DIR is not a directory"
     RUN_DIR="$(cd "$REVIEW_ONLY_DIR" && pwd)"
-    if [[ ! -f "$RUN_DIR/out/mutants.json" ]]; then
-        subs=("$RUN_DIR"/*/out/mutants.json)
+    if [[ ! -f "$RUN_DIR/debug/mutants.json" ]]; then
+        subs=("$RUN_DIR"/*/debug/mutants.json)
         [[ -f "${subs[0]}" ]] || die "no mutants.json under $RUN_DIR (pass a run directory from results/)"
+        [[ "$NESTED" == 1 ]] || { RESULT_DIR="$RUN_DIR"; SUMMARY_DIRS=("${subs[@]%/debug/mutants.json}"); }
         trap report_time EXIT
         pass=()
         set -- "${ORIG_ARGS[@]}"
@@ -494,21 +536,21 @@ if [[ -n "$REVIEW_ONLY_DIR" ]]; then
         done
         pids=() failed=()
         for m in "${subs[@]}"; do
-            "$0" ${pass[@]+"${pass[@]}"} --review-only "${m%/out/mutants.json}" &
+            "$0" ${pass[@]+"${pass[@]}"} --review-only "${m%/debug/mutants.json}" &
             pids+=("$!")
         done
         for i in "${!subs[@]}"; do
-            wait "${pids[$i]}" || failed+=("${subs[$i]%/out/mutants.json}")
+            wait "${pids[$i]}" || failed+=("${subs[$i]%/debug/mutants.json}")
         done
         (( ${#failed[@]} == 0 )) || die "failed: ${failed[*]}"
         exit 0
     fi
-    TARGET_FILE="$(jq -r '.target.file // empty' "$RUN_DIR/out/mutants.json")"
-    REVIEW_ONLY_COMMIT="$(jq -r '.repo.commit // empty' "$RUN_DIR/out/mutants.json")"
+    TARGET_FILE="$(jq -r '.target.file // empty' "$RUN_DIR/debug/mutants.json")"
+    REVIEW_ONLY_COMMIT="$(jq -r '.repo.commit // empty' "$RUN_DIR/debug/mutants.json")"
     [[ -n "$TARGET_FILE" && -n "$REVIEW_ONLY_COMMIT" ]] \
-        || die "$RUN_DIR/out/mutants.json names no target file or commit"
+        || die "$RUN_DIR/debug/mutants.json names no target file or commit"
     # Nothing to review is not worth a container and a fetch.
-    if [[ "$(jq '.mutants | length' "$RUN_DIR/out/mutants.json")" == 0 ]]; then
+    if [[ "$(jq '.mutants | length' "$RUN_DIR/debug/mutants.json")" == 0 ]]; then
         log "$TARGET_FILE: no mutants to review"
         exit 0
     fi
@@ -632,7 +674,7 @@ if [[ -n "$PR" && -z "$TARGET_FILE" ]]; then
         local d found=""
         for d in "$OUT_ROOT/pr-$PR-"*/"$(slug_of "$1")"/; do
             d="${d%/}"
-            [[ ! -L "$d" && -f "$d/cache-key" && "$(< "$d/cache-key")" == "$2" && -s "$d/out/mutants.json" ]] \
+            [[ ! -L "$d" && -f "$d/cache-key" && "$(< "$d/cache-key")" == "$2" && -s "$d/debug/mutants.json" ]] \
                 && found="$d"
         done
         printf '%s' "$found"
@@ -641,7 +683,9 @@ if [[ -n "$PR" && -z "$TARGET_FILE" ]]; then
     # One stamp for every file, so each run dir is known here.
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     run_root="$OUT_ROOT/pr-$PR-$stamp"
-    SUMMARY_FILE="$run_root/summary.json"
+    mkdir -p "$run_root/debug"
+    RESULT_DIR="$run_root"
+    SUMMARY_FILE="$run_root/debug/summary.json"
     SUMMARY_DIRS=()
     for f in "${files[@]}"; do SUMMARY_DIRS+=("$run_root/$(slug_of "$f")"); done
     # What the harness itself brings to a run: the image, the scripts in it, the
@@ -658,13 +702,13 @@ if [[ -n "$PR" && -z "$TARGET_FILE" ]]; then
             log "=== $f: unchanged since ${prev#"$OUT_ROOT"/}; reusing its mutants ==="
             dir="$run_root/$(slug_of "$f")"
             # The old review stream goes too: its cost is not this run's.
-            mkdir -p "$dir/work" && cp -r "$prev/out" "$dir/" && rm -rf "$dir/out/verify" "$dir/out/review.stream.jsonl"
+            mkdir -p "$dir/work" && cp -r "$prev/debug" "$dir/" && rm -rf "$dir/debug/verify" "$dir/debug/review.stream.jsonl"
             # Name the run that generated them, not one that reused them too.
             if [[ -f "$prev/reused-from" ]]; then cp "$prev/reused-from" "$dir/"
             else printf '%s\n' "${prev#"$OUT_ROOT"/}" > "$dir/reused-from"; fi
             for j in mutants.json report.json; do
-                jq --arg c "$head" '.repo.commit = $c' "$dir/out/$j" > "$dir/out/$j.tmp" \
-                    && mv "$dir/out/$j.tmp" "$dir/out/$j"
+                jq --arg c "$head" '.repo.commit = $c' "$dir/debug/$j" > "$dir/debug/$j.tmp" \
+                    && mv "$dir/debug/$j.tmp" "$dir/debug/$j"
             done
             pids+=(cached)
             continue
@@ -699,7 +743,7 @@ if [[ -n "$PR" && -z "$TARGET_FILE" ]]; then
             log "=== $f: verifying ==="
             "$0" "${ver_args[@]}" --verify-only "$dir" || { failed+=("$f"); continue; }
             # No verify dir means nothing was runnable, and no baseline ran.
-            [[ -d "$dir/out/verify" ]] && baseline=(--verify-arg --no-baseline)
+            [[ -d "$dir/debug/verify" ]] && baseline=(--verify-arg --no-baseline)
         done
         # The rest are shared out between workers, each with its own copy of that
         # built volume: they cannot share one build tree. A host clone is one
@@ -753,9 +797,9 @@ if [[ -n "$PR" && -z "$TARGET_FILE" ]]; then
                 src="generated in this run"
                 [[ -f "$dir/reused-from" ]] && src="reused from $(< "$dir/reused-from")"
                 printf '\n## %s\n\n%s\n\n' "$f" "$src"
-                if [[ ! -s "$dir/out/mutants.json" ]]; then echo "no mutants.json: generation failed"; continue; fi
+                if [[ ! -s "$dir/debug/mutants.json" ]]; then echo "no mutants.json: generation failed"; continue; fi
                 results=/dev/null
-                [[ -s "$dir/out/verify/results.jsonl" ]] && results="$dir/out/verify/results.jsonl"
+                [[ -s "$dir/debug/verify/results.jsonl" ]] && results="$dir/debug/verify/results.jsonl"
                 jq -r --slurpfile r "$results" '
                     if (.mutants // []) == [] then "no mutants" else
                     "| mutant | severity | result | time | title |",
@@ -767,10 +811,10 @@ if [[ -n "$PR" && -z "$TARGET_FILE" ]]; then
                          elif .compiles == false then "does not compile"
                          else "not verified" end) +
                         " | \(if $v.seconds then "\($v.seconds)s" else "" end) | \(.title | gsub("\\|"; "\\|")) |")
-                    end' "$dir/out/mutants.json"
+                    end' "$dir/debug/mutants.json"
             done
-        } > "$run_root/summary.md"
-        log "summary: $run_root/summary.md"
+        } > "$run_root/debug/summary.md"
+        log "summary: $run_root/debug/summary.md"
     fi
     (( ${#failed[@]} == 0 )) || die "failed: ${failed[*]}"
     log "all ${#files[@]} file(s) of pull request #$PR done"
@@ -797,7 +841,7 @@ SLUG="$(slug_of "$TARGET_FILE")"
 STAMP="${MUTANT_HARNESS_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_DIR="${MUTANT_HARNESS_RUN_DIR:-$OUT_ROOT/$SLUG-$STAMP}"
 WORK_DIR="$RUN_DIR/work"
-OUT_DIR="$RUN_DIR/out"
+OUT_DIR="$RUN_DIR/debug"
 mkdir -p "$WORK_DIR" "$OUT_DIR/patches"
 
 # With verification the review waits for it; see review_args.
@@ -886,7 +930,10 @@ fi
 log "run dir: $RUN_DIR"
 trap report_time EXIT
 # A file of a --pr run, or a --review-only, is summed up by whoever started it.
-[[ -n "${MUTANT_HARNESS_RUN_DIR:-}" ]] || { SUMMARY_FILE="$RUN_DIR/summary.json"; SUMMARY_DIRS=("$RUN_DIR"); }
+if [[ "$NESTED" == 0 ]]; then
+    RESULT_DIR="$RUN_DIR"; SUMMARY_DIRS=("$RUN_DIR")
+    [[ -n "$REVIEW_ONLY_COMMIT" ]] || SUMMARY_FILE="$OUT_DIR/summary.json"
+fi
 if [[ -n "$REVIEW_ONLY_COMMIT" ]]; then
     log "reviewing the mutants of $TARGET_FILE (model=${REVIEW_MODEL:-$MODEL}) ..."
 else
@@ -945,7 +992,7 @@ if [[ -s "$MANIFEST" ]] && command -v jq >/dev/null && jq empty "$MANIFEST" 2>/d
     ' "$SUMMARY_SRC"
     echo
     if [[ "$SUMMARY_SRC" == "$REVIEWED" ]]; then
-        log "reviewed mutants: $REVIEWED   <- start here"
+        log "reviewed mutants: $REVIEWED"
         log "raw mutants:      $MANIFEST"
         log "review trace:     $OUT_DIR/review.txt"
     else

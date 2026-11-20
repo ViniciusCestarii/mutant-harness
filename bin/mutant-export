@@ -5,8 +5,9 @@
   mutant-export results/src-pow-cpp-latest --repo ~/src/bitcoin -o import.json
   mutant-export results/pr-35591-20261026T105228Z -o import.json   # every verified file of a PR run
 
-Reads out/mutants.json and out/verify/results.jsonl, keeps the mutants whose
-status is `live`, and writes { "tool", "defaults", "mutants" }. originalCode and
+Reads debug/mutants.json and debug/verify/results.jsonl, keeps the mutants whose
+status is `live` (and, if debug/mutants-reviewed.json exists, whose review
+verdict is `good`), and writes { "tool", "defaults", "mutants" }. originalCode and
 mutatedCode are the smallest contiguous span covering every hunk of the patch,
 so the file at the run's commit is needed: taken from --repo with `git show`,
 otherwise fetched from GitHub. The repo, build and test commands come from
@@ -140,7 +141,7 @@ def description(m):
 
 def export_run(run, repo):
     """(defaults, rows) for the live mutants of one file's run directory."""
-    out = run / "out"
+    out = run / "debug"
     manifest_path = out / "mutants.json"
     results_path = out / "verify" / "results.jsonl"
     if not manifest_path.is_file():
@@ -159,6 +160,13 @@ def export_run(run, repo):
         if line.strip():
             r = json.loads(line)
             status[r["id"]] = r["status"]
+
+    # Drop mutants the review judged noise or invalid.
+    reviewed_path = out / "mutants-reviewed.json"
+    if reviewed_path.is_file():
+        for m in json.loads(reviewed_path.read_text())["mutants"]:
+            if m.get("verdict") != "good":
+                status.pop(m["id"], None)
 
     github = re.search(r"github\.com[/:](.+?)(?:\.git)?$", profile["REPO_URL"])
     if not github:
@@ -212,16 +220,16 @@ def main():
     args = ap.parse_args()
 
     run = Path(args.run).resolve()
-    if (run / "mutants.json").is_file():  # given out/ itself
+    if (run / "mutants.json").is_file():  # given debug/ itself
         run = run.parent
-    if (run / "out" / "mutants.json").is_file():
+    if (run / "debug" / "mutants.json").is_file():
         runs = [run]
     else:  # a PR run: one run directory per file
         runs = []
         for d in sorted(run.iterdir()):
-            if not (d / "out" / "mutants.json").is_file():
+            if not (d / "debug" / "mutants.json").is_file():
                 continue
-            if not (d / "out" / "verify" / "results.jsonl").is_file():
+            if not (d / "debug" / "verify" / "results.jsonl").is_file():
                 print(f"mutant-export: skipping {d.name}: not verified", file=sys.stderr)
                 continue
             runs.append(d)
